@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"testing"
 
 	"github.com/SchemaBio/Loligo/internal/model"
@@ -8,8 +9,8 @@ import (
 
 func TestBuiltinPipelineCatalogContainsSupportedFlows(t *testing.T) {
 	items := builtinPipelineResponses()
-	if len(items) != 6 {
-		t.Fatalf("expected exactly six built-in pipelines, got %d", len(items))
+	if len(items) != 12 {
+		t.Fatalf("expected twelve built-in entries including planned workflows, got %d", len(items))
 	}
 	if items[0].ID != model.BuiltinPipelineWESSingleID || items[0].Template != "single" || !items[0].IsBuiltin {
 		t.Fatalf("unexpected single-sample built-in: %+v", items[0])
@@ -64,5 +65,23 @@ func TestResolvePipelineBaseInheritsReferenceGenome(t *testing.T) {
 	}
 	if _, _, err := resolvePipelineBase("custom-pipeline", "", ""); err == nil {
 		t.Fatal("custom pipeline must not be accepted as a base pipeline")
+	}
+}
+
+func TestPendingOncologyPipelines(t *testing.T) {
+	for _, slug := range []string{"tumor-paired", "tumor-single", "rna-fusion"} {
+		for _, genome := range []string{"hg19", "hg38"} {
+			id := "builtin-" + slug + "-" + genome
+			item, err := (&PipelineService{}).GetPipeline(context.Background(), id, model.OverlayActor{})
+			if err != nil || !item.Planned || item.ResourceAvailable || item.Status != model.PipelineStatusInactive || !model.IsBuiltinPipelineID(id) {
+				t.Fatalf("planned entry %s: %+v, %v", id, item, err)
+			}
+			if _, err := (&TaskService{}).resolveAnalysisPipeline(&model.TaskCreateRequest{PipelineID: id}, model.OverlayActor{}); err == nil || err.Error() != item.ResourceError {
+				t.Fatalf("expected unavailable pipeline %s, got %v", id, err)
+			}
+			if requireAnalysisAvailable(item.Template) == nil {
+				t.Fatalf("queued template %s is enabled", item.Template)
+			}
+		}
 	}
 }

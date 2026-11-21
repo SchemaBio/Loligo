@@ -1,6 +1,7 @@
 package model
 
 import (
+	"slices"
 	"strings"
 	"time"
 )
@@ -56,6 +57,7 @@ type Pipeline struct {
 
 // PipelineResponse is the API response for a pipeline
 type PipelineResponse struct {
+	Planned           bool             `json:"planned,omitempty"`
 	ResourceAvailable bool             `json:"resource_available"`
 	ResourceError     string           `json:"resource_error,omitempty"`
 	ID                string           `json:"id"`
@@ -175,7 +177,35 @@ func PipelineTemplate(baseType PipelineBaseType) string {
 	return "single"
 }
 
+// PlannedOncologyPipelines lists catalog entries awaiting an execution contract.
+func PlannedOncologyPipelines() []PipelineResponse { return slices.Clone(plannedOncologyPipelines) }
+
+var plannedOncologyPipelines = func() []PipelineResponse {
+	var items []PipelineResponse
+	for _, flow := range []struct{ template, name string }{
+		{"tumor_paired", "肿瘤配对分析"},
+		{"tumor_single", "肿瘤单样本分析"},
+		{"rna_fusion", "RNA 融合分析"},
+	} {
+		for _, genome := range []string{"hg19", "hg38"} {
+			id := "builtin-" + strings.ReplaceAll(flow.template, "_", "-") + "-" + genome
+			items = append(items, PipelineResponse{
+				ID: id, BasePipelineID: id, BaseType: PipelineBaseType(flow.template),
+				Name: flow.name + "_" + genome, ReferenceGenome: genome, Template: flow.template,
+				IsBuiltin: true, Planned: true, Status: PipelineStatusInactive,
+				ResourceError: "Workflow execution is not available for " + flow.template,
+			})
+		}
+	}
+	return items
+}()
+
 func IsBuiltinPipelineID(id string) bool {
+	for _, item := range plannedOncologyPipelines {
+		if item.ID == strings.TrimSpace(id) {
+			return true
+		}
+	}
 	switch CanonicalBuiltinPipelineID(id) {
 	case BuiltinPipelineVCFHG19ID, BuiltinPipelineVCFHG38ID, BuiltinPipelineWESSingleID, BuiltinPipelineWESFamilyID,
 		BuiltinPipelineWESSingleHG38ID, BuiltinPipelineWESFamilyHG38ID:

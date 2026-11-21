@@ -1,9 +1,8 @@
 [English](README.md) | **中文**
 
-# ZhiJi 肿瘤学初始基线 (Loligo)
+# Loligo
 
-本仓库是 ZhiJi 肿瘤学初始基线，后端是 Loligo。它仍然使用继承的 germline
-工作流配置、数据结构和业务行为，没有改写成另一套肿瘤专用流程。
+Loligo 是知几肿瘤分析平台的后端，负责样本、任务、流程资源与结果管理。流程接口提供 hg19 和 hg38 的 VCF 注释。肿瘤配对、肿瘤单样本、RNA 融合在两个参考版本下均标记为 `planned: true` 和 `status: inactive`。已有客户端仍可使用单样本和家系 WES 流程。
 
 > 自部署生产入口位于 `deploy/`。Compose 运行 PostgreSQL 和 ZhiJi，systemd
 > 运行宿主机服务 `zhiji-loligo`。ZhiJi 容器通过

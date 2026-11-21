@@ -1,10 +1,8 @@
 **English** | [中文](README.zh-CN.md)
 
-# ZhiJi oncology initial baseline (Loligo)
+# Loligo
 
-This repository is the ZhiJi oncology initial baseline. Loligo is the backend.
-It still uses the inherited germline workflow profiles, schemas, and business
-behavior. Those profiles are not rewritten into a separate oncology workflow.
+Loligo is the backend for the ZhiJi oncology platform. It manages samples, analysis tasks, pipeline resources and results. The pipeline API lists VCF annotation for hg19 and hg38. Tumor-paired, tumor-only and RNA fusion entries are marked `planned: true` and `status: inactive` for both genomes. The existing single-sample and family WES profiles remain available to existing clients.
 
 > The self-hosted production entry point is `deploy/`. Compose runs PostgreSQL
 > and ZhiJi. systemd runs the host service `zhiji-loligo`. ZhiJi reaches that

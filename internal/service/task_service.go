@@ -765,6 +765,11 @@ func (s *TaskService) resolveAnalysisPipeline(req *model.TaskCreateRequest, acto
 		}
 		req.Inputs["reference_genome"] = genome
 	}
+	for _, item := range model.PlannedOncologyPipelines() {
+		if req.PipelineID == item.ID {
+			return nil, errors.New(item.ResourceError)
+		}
+	}
 	switch req.PipelineID {
 	case model.BuiltinPipelineVCFHG19ID, model.BuiltinPipelineVCFHG38ID:
 		genome := "hg19"

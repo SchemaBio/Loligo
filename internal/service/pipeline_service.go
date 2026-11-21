@@ -74,13 +74,13 @@ func builtinPipelineResponses() []model.PipelineResponse {
 		{ID: model.BuiltinPipelineVCFHG38ID, BasePipelineID: model.BuiltinPipelineVCFHG38ID, Name: "VCF SNP/InDel 注释_hg38", BaseType: model.PipelineBaseVCFAnnotation, Version: "builtin-v1", ReferenceGenome: "hg38", Template: "vcf2anno", ResourceAvailable: true, IsBuiltin: true, Status: model.PipelineStatusActive},
 	}
 	for i := range items {
-		if requireAnalysisAvailable(items[i].Template) != nil {
+		if err := requireAnalysisAvailable(items[i].Template); err != nil {
 			items[i].Status = model.PipelineStatusInactive
 			items[i].ResourceAvailable = false
-			items[i].ResourceError = ErrFamilyAnalysisUnavailable.Error()
+			items[i].ResourceError = err.Error()
 		}
 	}
-	return items
+	return append(items, model.PlannedOncologyPipelines()...)
 }
 
 func isAllowedPipelineBase(value model.PipelineBaseType) bool {
@@ -103,12 +103,12 @@ func resolvePipelineBase(basePipelineID string, legacyBase model.PipelineBaseTyp
 		return model.PipelineBaseWESFamily, "hg38", nil
 	case "":
 		if !isAllowedPipelineBase(legacyBase) {
-			return "", "", fmt.Errorf("base_pipeline_id must reference a built-in WES pipeline")
+			return "", "", fmt.Errorf("base_pipeline_id must reference a supported built-in pipeline")
 		}
 		genome, err := normalizePipelineGenome(legacyGenome)
 		return legacyBase, genome, err
 	default:
-		return "", "", fmt.Errorf("base_pipeline_id must reference a built-in WES pipeline")
+		return "", "", fmt.Errorf("base_pipeline_id must reference a supported built-in pipeline")
 	}
 }
 
@@ -238,10 +238,11 @@ func (s *PipelineService) ListPipelines(_ context.Context, query *model.Pipeline
 		return nil, err
 	}
 	items := builtinPipelineResponses()
+	total += int64(len(items))
 	for i := range pipelines {
 		items = append(items, s.toResponse(&pipelines[i], nil, nil))
 	}
-	return &model.PipelineListResponse{Total: total + int64(len(builtinPipelineResponses())), Items: items}, nil
+	return &model.PipelineListResponse{Total: total, Items: items}, nil
 }
 
 func (s *PipelineService) UpdatePipeline(_ context.Context, id string, req *model.PipelineUpdateRequest, actor model.OverlayActor) (*model.PipelineResponse, error) {
@@ -332,10 +333,10 @@ func (s *PipelineService) DeletePipeline(_ context.Context, id string, actor mod
 func (s *PipelineService) toResponse(pipeline *model.Pipeline, bed *model.DataAsset, baseline *model.CNVBaseline) model.PipelineResponse {
 	response := pipeline.ToResponse()
 	response.ResourceAvailable = true
-	if requireAnalysisAvailable(response.Template) != nil {
+	if err := requireAnalysisAvailable(response.Template); err != nil {
 		response.Status = model.PipelineStatusInactive
 		response.ResourceAvailable = false
-		response.ResourceError = ErrFamilyAnalysisUnavailable.Error()
+		response.ResourceError = err.Error()
 		return response
 	}
 	if pipeline.BaseType == model.PipelineBaseVCFAnnotation {
