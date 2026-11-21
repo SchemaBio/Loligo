@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TEST_DIR="$(mktemp -d)"
+trap 'rm -rf "$TEST_DIR"' EXIT
+
+cp "$SOURCE_DIR/deploy.sh" "$SOURCE_DIR/.env.example" "$SOURCE_DIR/docker-compose.yml" "$TEST_DIR/"
+mkdir -p "$TEST_DIR/bin" "$TEST_DIR/workflows/conf"
+touch "$TEST_DIR/workflows/conf/local.cfg"
+cat >"$TEST_DIR/bin/docker" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+cat >"$TEST_DIR/bin/miniwdl" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+chmod +x "$TEST_DIR/bin/docker" "$TEST_DIR/bin/miniwdl"
+
+first_output="$(cd "$TEST_DIR" && bash ./deploy.sh init)"
+cp "$TEST_DIR/.generated/runtime.env" "$TEST_DIR/first-runtime.env"
+second_output="$(cd "$TEST_DIR" && bash ./deploy.sh init)"
+cmp "$TEST_DIR/first-runtime.env" "$TEST_DIR/.generated/runtime.env"
+admin_password="$(sed -n 's/^DEFAULT_ADMIN_PASSWORD=//p' "$TEST_DIR/.generated/runtime.env")"
+[[ "$admin_password" =~ [A-Z] && "$admin_password" =~ [a-z] && "$admin_password" =~ [0-9] ]]
+[ "${#admin_password}" -ge 12 ]
+[ ! -e "$TEST_DIR/.generated/sepiida-query-keys.txt" ]
+[ ! -e "$TEST_DIR/.generated/sepiida-agent-keys.txt" ]
+! grep -q '^SEPIIDA_DB_PASSWORD=' "$TEST_DIR/.generated/runtime.env"
+! grep -q '^SEPIIDA_QUERY_KEY=' "$TEST_DIR/.generated/runtime.env"
+! grep -q '^SEPIIDA_AGENT_KEY=' "$TEST_DIR/.generated/runtime.env"
+! grep -q 'sepiida-server' "$TEST_DIR/docker-compose.yml"
+! grep -q 'sepiida-keys' "$TEST_DIR/docker-compose.yml"
+! grep -q 'SEPIIDA_DB_PASSWORD' "$TEST_DIR/docker-compose.yml"
+! grep -q 'build_sepiida_agent' "$SOURCE_DIR/deploy.sh"
+! grep -q 'SEPIIDA_AGENT_KEY' "$SOURCE_DIR/deploy.sh"
+! grep -q 'SEPIIDA_DB_PASSWORD' "$SOURCE_DIR/deploy.sh"
+! grep -q 'sepiida-agent' "$SOURCE_DIR/deploy.sh"
+! grep -q 'sepiida' "$SOURCE_DIR/postgres/init-databases.sql"
+! grep -q 'sepiida' "$SOURCE_DIR/postgres/init-databases.sh"
+grep -q 'CREATE DATABASE loligo OWNER loligo' "$SOURCE_DIR/postgres/init-databases.sql"
+grep -q 'zhiji-loligo.service' "$SOURCE_DIR/deploy.sh"
+grep -q 'host.docker.internal:host-gateway' "$SOURCE_DIR/docker-compose.yml"
+grep -Fq 'http://host.docker.internal:${LOLIGO_PORT:-8082}/api' "$SOURCE_DIR/docker-compose.yml"
+grep -Fq 'ZHIJI_API_URL: /api' "$SOURCE_DIR/docker-compose.yml"
+! grep -Fq 'http://loligo:8080/api' "$SOURCE_DIR/docker-compose.yml"
+
+if [ "$(uname -s)" = "Linux" ]; then
+  [ "$(stat -c %a "$TEST_DIR/.generated/runtime.env")" = "600" ]
+  if [ "${EUID:-$(id -u)}" -eq 0 ]; then
+    chown 1000:1000 "$TEST_DIR/.env"
+    (cd "$TEST_DIR" && bash ./deploy.sh init >/dev/null)
+    [ "$(stat -c '%u:%g' "$TEST_DIR/.generated/runtime.env")" = "1000:1000" ]
+    [ ! -e "$TEST_DIR/.generated/sepiida-agent-keys.txt" ]
+    cmp "$TEST_DIR/first-runtime.env" "$TEST_DIR/.generated/runtime.env"
+  fi
+fi
+
+while IFS='=' read -r name value; do
+  case "$name" in
+    *_PASSWORD|*_SECRET|*_KEY)
+      [ -z "$value" ] || ! printf '%s\n%s\n' "$first_output" "$second_output" | grep -Fq "$value"
+      ;;
+  esac
+done <"$TEST_DIR/.generated/runtime.env"
+
+sed -i \
+  -e 's|^PUBLIC_ORIGIN=.*|PUBLIC_ORIGIN=https://self-hosted.test|' \
+  -e "s|^WORKFLOW_HOST_DIR=.*|WORKFLOW_HOST_DIR=$TEST_DIR/workflows|" \
+  -e "s|^MINIWDL_PATH=.*|MINIWDL_PATH=$TEST_DIR/bin/miniwdl|" \
+  "$TEST_DIR/.env"
+(cd "$TEST_DIR" && PATH="$TEST_DIR/bin:$PATH" bash ./deploy.sh check >/dev/null)
+
+sed -i 's|^SEPIIDA_ENABLED=.*|SEPIIDA_ENABLED=true|' "$TEST_DIR/.env"
+if (cd "$TEST_DIR" && PATH="$TEST_DIR/bin:$PATH" bash ./deploy.sh check >/dev/null 2>&1); then
+  echo "enabled Sepiida without external values unexpectedly passed" >&2
+  exit 1
+fi
+
+sed -i \
+  -e 's|^SEPIIDA_URL=.*|SEPIIDA_URL=https://sepiida.internal.test|' \
+  -e 's|^SEPIIDA_QUERY_KEY=.*|SEPIIDA_QUERY_KEY=external-query-key-value|' \
+  "$TEST_DIR/.env"
+check_output="$(cd "$TEST_DIR" && PATH="$TEST_DIR/bin:$PATH" bash ./deploy.sh check)"
+if printf '%s\n' "$check_output" | grep -Fq 'external-query-key-value'; then
+  echo "external Sepiida query key was printed" >&2
+  exit 1
+fi
+! grep -q '^SEPIIDA_QUERY_KEY=' "$TEST_DIR/.generated/runtime.env"
+
+sed -i 's|^LOLIGO_PORT=.*|LOLIGO_PORT=70000|' "$TEST_DIR/.env"
+if (cd "$TEST_DIR" && PATH="$TEST_DIR/bin:$PATH" bash ./deploy.sh check >/dev/null 2>&1); then
+  echo "invalid service port unexpectedly passed" >&2
+  exit 1
+fi
+
+printf 'Self-hosted deploy initialization tests passed.\n'

@@ -1,0 +1,147 @@
+package handler
+
+import (
+	"errors"
+	"net/http"
+	"path/filepath"
+
+	"github.com/SchemaBio/Loligo/internal/config"
+	"github.com/SchemaBio/Loligo/internal/middleware"
+	"github.com/SchemaBio/Loligo/internal/model"
+	"github.com/SchemaBio/Loligo/internal/service"
+	"github.com/gin-gonic/gin"
+)
+
+type DataAssetHandler struct{ svc *service.DataAssetService }
+
+func NewDataAssetHandler(cfg *config.Config) *DataAssetHandler {
+	return &DataAssetHandler{svc: service.NewDataAssetService(cfg)}
+}
+
+func (h *DataAssetHandler) Config(c *gin.Context) { Success(c, h.svc.Config()) }
+
+func (h *DataAssetHandler) List(c *gin.Context) {
+	var query model.DataAssetListQuery
+	if err := c.ShouldBindQuery(&query); err != nil {
+		ErrorBadRequest(c, err.Error())
+		return
+	}
+	if query.Page == 0 {
+		query.Page = 1
+	}
+	if query.PageSize == 0 {
+		query.PageSize = 20
+	}
+	userID, _, role, ok := middleware.GetCurrentUser(c)
+	if !ok {
+		ErrorUnauthorized(c, "Unauthorized")
+		return
+	}
+	if middleware.IsSharedInstance(c) || role == string(model.SystemRoleSuperAdmin) {
+		query.IncludeAll = true
+		query.SharedInstance = middleware.IsSharedInstance(c)
+	} else if orgID, hasOrg := middleware.GetCurrentOrg(c); hasOrg {
+		query.OrgID = orgID
+	} else {
+		query.CreatedBy = userID
+	}
+	items, total, err := h.svc.List(&query)
+	if err != nil {
+		ErrorInternal(c, err.Error())
+		return
+	}
+	SuccessList(c, items, total, query.Page, query.PageSize)
+}
+
+func (h *DataAssetHandler) Get(c *gin.Context) {
+	asset, err := h.svc.Get(c.Param("uuid"), taskActorFromContext(c))
+	if err != nil {
+		ErrorNotFound(c, "Data asset not found")
+		return
+	}
+	Success(c, model.DataAssetToResponse(asset))
+}
+
+func (h *DataAssetHandler) Update(c *gin.Context) {
+	var req model.DataAssetUpdateRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		ErrorBadRequest(c, err.Error())
+		return
+	}
+	asset, err := h.svc.Update(c.Param("uuid"), &req, taskActorFromContext(c))
+	if err != nil {
+		ErrorNotFound(c, "Data asset not found")
+		return
+	}
+	Success(c, model.DataAssetToResponse(asset))
+}
+
+func (h *DataAssetHandler) Download(c *gin.Context) {
+	target, filename, err := h.svc.Download(c.Request.Context(), c.Param("uuid"), taskActorFromContext(c))
+	if err != nil {
+		if errors.Is(err, service.ErrDataAssetDownloadDisabled) {
+			Error(c, http.StatusForbidden, "Data downloads are disabled in SaaS mode")
+			return
+		}
+		ErrorNotFound(c, "Data asset not found")
+		return
+	}
+	if target.URL != "" {
+		c.Redirect(http.StatusTemporaryRedirect, target.URL)
+		return
+	}
+	c.FileAttachment(target.LocalPath, filepath.Base(filename))
+}
+
+func (h *DataAssetHandler) Delete(c *gin.Context) {
+	if err := h.svc.Delete(c.Request.Context(), c.Param("uuid"), taskActorFromContext(c)); err != nil {
+		var inUse *service.ResourceInUseError
+		if errors.As(err, &inUse) {
+			c.JSON(http.StatusConflict, gin.H{"error": inUse.Error(), "references": inUse.References})
+			return
+		}
+		ErrorNotFound(c, "Data asset not found")
+		return
+	}
+	c.Status(http.StatusNoContent)
+}
+
+func (h *DataAssetHandler) ValidateBED(c *gin.Context) {
+	a, e := h.svc.ValidateBED(c.Request.Context(), c.Param("uuid"), taskActorFromContext(c))
+	if e != nil {
+		ErrorBadRequest(c, e.Error())
+		return
+	}
+	Success(c, model.DataAssetToResponse(a))
+}
+
+func (h *DataAssetHandler) ImportLocalPair(c *gin.Context) {
+	var req model.LocalDataImportRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		ErrorBadRequest(c, "invalid local import request")
+		return
+	}
+	assets, err := h.svc.ImportLocalPair(c.Request.Context(), &req, taskActorFromContext(c))
+	if err != nil {
+		status := http.StatusBadRequest
+		switch err.Error() {
+		case "local_import_disabled":
+			status = http.StatusNotFound
+		case "local_import_duplicate":
+			status = http.StatusConflict
+		case "local_import_busy":
+			status = http.StatusTooManyRequests
+		case "local_import_database":
+			status = http.StatusServiceUnavailable
+		case "local_import_permission_denied":
+			status = http.StatusForbidden
+		}
+		if status == http.StatusForbidden {
+			c.JSON(status, gin.H{"code": "permission_denied", "required_permission": "data.manage", "error": err.Error()})
+			return
+		}
+		c.JSON(status, gin.H{"code": err.Error(), "error": err.Error()})
+		return
+	}
+	SuccessCreated(c, assets)
+}

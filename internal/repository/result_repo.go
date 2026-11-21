@@ -1,0 +1,824 @@
+package repository
+
+import (
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/SchemaBio/Loligo/internal/database"
+	"github.com/SchemaBio/Loligo/internal/model"
+	"github.com/google/uuid"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+)
+
+// ResultRepository provides generic result operations
+type ResultRepository struct {
+	db *gorm.DB
+}
+
+func scopedResultQuery(db *gorm.DB, taskID, tenantID, attemptID string) *gorm.DB {
+	db = db.Where("task_id = ?", taskID)
+	if tenantID != "" {
+		db = db.Where("tenant_id = ?", tenantID)
+	}
+	if attemptID != "" {
+		db = db.Where("execution_attempt_id = ?", attemptID)
+	}
+	return db
+}
+
+// NewResultRepository creates a new result repository
+func NewResultRepository() *ResultRepository {
+	return &ResultRepository{
+		db: database.GetDB(),
+	}
+}
+
+// WithDB returns a repository using the supplied transaction/connection.
+// Importers use this to replace all result tables atomically.
+func (r *ResultRepository) WithDB(db *gorm.DB) *ResultRepository {
+	return &ResultRepository{db: db}
+}
+
+// ========== SNV/Indel ==========
+
+func (r *ResultRepository) FindSNVIndelsByTaskID(taskID string) ([]model.SNVIndel, error) {
+	var results []model.SNVIndel
+	err := r.db.Where("task_id = ?", taskID).Find(&results).Error
+	return results, err
+}
+
+func (r *ResultRepository) PaginateSNVIndels(query *model.SNVIndelListQuery) ([]model.SNVIndel, int64, error) {
+	db := scopedResultQuery(r.db.Model(&model.SNVIndel{}), query.TaskID, query.TenantID, query.ExecutionAttemptID)
+	if query.Search != "" {
+		s := "%" + query.Search + "%"
+		db = db.Where("gene LIKE ? OR hgv_sc LIKE ? OR hgv_sp LIKE ?", s, s, s)
+	}
+	if query.Gene != "" {
+		db = db.Where("gene = ?", query.Gene)
+	}
+	if query.Classification != "" {
+		db = db.Where("acmg_classification = ?", query.Classification)
+	}
+	if query.GeneListID != "" {
+		// GeneListID is resolved by ResultService against the authenticated
+		// actor. Gene lists are stored as JSONB in gene_lists, so querying the
+		// legacy/non-existent gene_list_genes table is both incorrect and unsafe.
+		if len(query.GeneListGenes) == 0 {
+			db = db.Where("1 = 0")
+		} else {
+			db = db.Where("gene IN ?", query.GeneListGenes)
+		}
+	}
+
+	var total int64
+	if err := db.Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+
+	page := query.Page
+	if page < 1 {
+		page = 1
+	}
+	pageSize := query.PageSize
+	if pageSize < 1 {
+		pageSize = 10
+	}
+
+	var results []model.SNVIndel
+	db = applyResultOrder(db, query.Sort, query.Direction, map[string]string{
+		"classification": acmgClassificationOrder, "gene": "gene", "chromosome": naturalChromosomeOrder("chromosome"),
+		"position": "position", "depth": "depth", "vaf": "vaf", "alleleFrequency": "vaf", "zygosity": "zygosity",
+		"acmgClassification": acmgClassificationOrder, "reviewed": "reviewed", "focused": "focused",
+		"gnomadAF": "gnomad_af", "gnomadEasAF": "gnomad_eas_af", "clinvarSignificance": "clinvar_significance",
+	}, acmgClassificationOrder+" ASC", "gene ASC")
+	err := db.Offset((page - 1) * pageSize).Limit(pageSize).Find(&results).Error
+	return results, total, err
+}
+
+func (r *ResultRepository) FindSNVIndelByID(id string) (*model.SNVIndel, error) {
+	var result model.SNVIndel
+	err := r.db.Where("id = ?", id).First(&result).Error
+	return &result, err
+}
+
+func (r *ResultRepository) UpdateSNVIndelReview(id string, reviewed bool, reviewer string) error {
+	return r.db.Model(&model.SNVIndel{}).Where("id = ?", id).Updates(map[string]interface{}{
+		"reviewed":    reviewed,
+		"reviewed_by": reviewer, "reviewed_at": reviewTimestamp(reviewed),
+	}).Error
+}
+
+func (r *ResultRepository) UpdateSNVIndelFocus(id string, focused bool, focuser string) error {
+	return r.db.Model(&model.SNVIndel{}).Where("id = ?", id).Updates(map[string]interface{}{
+		"focused":    focused,
+		"focused_by": focuser,
+	}).Error
+}
+
+// ========== CNV Segment ==========
+
+func (r *ResultRepository) PaginateCNVSegments(query *model.CNVSegmentListQuery) ([]model.CNVSegment, int64, error) {
+	db := scopedResultQuery(r.db.Model(&model.CNVSegment{}), query.TaskID, query.TenantID, query.ExecutionAttemptID)
+	if query.Search != "" {
+		s := "%" + query.Search + "%"
+		db = db.Where(
+			"chromosome LIKE ? OR dosage_genes LIKE ? OR gen_ccad_genes LIKE ? OR iscn LIKE ? OR classification LIKE ?",
+			s, s, s, s, s,
+		)
+	}
+	if query.Type != "" {
+		db = db.Where("type = ?", query.Type)
+	}
+
+	var total int64
+	if err := db.Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+
+	page := query.Page
+	if page < 1 {
+		page = 1
+	}
+	pageSize := query.PageSize
+	if pageSize < 1 {
+		pageSize = 10
+	}
+
+	var results []model.CNVSegment
+	db = applyResultOrder(db, query.Sort, query.Direction, map[string]string{
+		"chromosome": naturalChromosomeOrder("chromosome"), "start": "start_position", "startPosition": "start_position",
+		"end": "end_position", "endPosition": "end_position", "length": "(end_position - start_position)", "type": "type",
+		"classification": "classification", "confidence": "weight", "reviewed": "reviewed", "focused": "focused",
+	}, naturalChromosomeOrder("chromosome")+" ASC", "start_position ASC")
+	err := db.Offset((page - 1) * pageSize).Limit(pageSize).Find(&results).Error
+	return results, total, err
+}
+
+func (r *ResultRepository) FindCNVSegmentByID(id string) (*model.CNVSegment, error) {
+	var result model.CNVSegment
+	err := r.db.Where("id = ?", id).First(&result).Error
+	return &result, err
+}
+
+func (r *ResultRepository) UpdateCNVSegmentReview(id string, reviewed bool, reviewer string) error {
+	return r.db.Model(&model.CNVSegment{}).Where("id = ?", id).Updates(map[string]interface{}{
+		"reviewed": reviewed, "reviewed_by": reviewer, "reviewed_at": reviewTimestamp(reviewed),
+	}).Error
+}
+
+func (r *ResultRepository) UpdateCNVSegmentFocus(id string, focused bool, focuser string) error {
+	return r.db.Model(&model.CNVSegment{}).Where("id = ?", id).Updates(map[string]interface{}{
+		"focused": focused, "focused_by": focuser,
+	}).Error
+}
+
+// ========== CNV Exon ==========
+
+func (r *ResultRepository) PaginateCNVExons(query *model.CNVExonListQuery) ([]model.CNVExon, int64, error) {
+	db := scopedResultQuery(r.db.Model(&model.CNVExon{}), query.TaskID, query.TenantID, query.ExecutionAttemptID)
+	if query.Search != "" {
+		s := "%" + query.Search + "%"
+		db = db.Where("gene LIKE ? OR transcript LIKE ?", s, s)
+	}
+	if query.Gene != "" {
+		db = db.Where("gene = ?", query.Gene)
+	}
+
+	var total int64
+	if err := db.Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+
+	page := query.Page
+	if page < 1 {
+		page = 1
+	}
+	pageSize := query.PageSize
+	if pageSize < 1 {
+		pageSize = 10
+	}
+
+	var results []model.CNVExon
+	db = applyResultOrder(db, query.Sort, query.Direction, map[string]string{
+		"gene": "gene", "chromosome": naturalChromosomeOrder("chromosome"), "start": "start_position", "startPosition": "start_position",
+		"end": "end_position", "endPosition": "end_position", "type": "type", "classification": "classification",
+		"ratio": "copy_ratio", "confidence": "weight", "reviewed": "reviewed", "focused": "focused",
+	}, "gene ASC", "start_position ASC", "end_position ASC")
+	err := db.Offset((page - 1) * pageSize).Limit(pageSize).Find(&results).Error
+	return results, total, err
+}
+
+func (r *ResultRepository) FindCNVExonByID(id string) (*model.CNVExon, error) {
+	var result model.CNVExon
+	err := r.db.Where("id = ?", id).First(&result).Error
+	return &result, err
+}
+
+func (r *ResultRepository) UpdateCNVExonReview(id string, reviewed bool, reviewer string) error {
+	return r.db.Model(&model.CNVExon{}).Where("id = ?", id).Updates(map[string]interface{}{
+		"reviewed": reviewed, "reviewed_by": reviewer, "reviewed_at": reviewTimestamp(reviewed),
+	}).Error
+}
+
+func (r *ResultRepository) UpdateCNVExonFocus(id string, focused bool, focuser string) error {
+	return r.db.Model(&model.CNVExon{}).Where("id = ?", id).Updates(map[string]interface{}{
+		"focused": focused, "focused_by": focuser,
+	}).Error
+}
+
+// ========== STR ==========
+
+func (r *ResultRepository) PaginateSTRs(query *model.STRListQuery) ([]model.STR, int64, error) {
+	db := scopedResultQuery(r.db.Model(&model.STR{}), query.TaskID, query.TenantID, query.ExecutionAttemptID)
+	if query.Search != "" {
+		s := "%" + query.Search + "%"
+		db = db.Where(
+			"gene LIKE ? OR chromosome LIKE ? OR repeat_unit LIKE ? OR disease LIKE ? OR inheritance LIKE ?",
+			s, s, s, s, s,
+		)
+	}
+	if query.Status != "" {
+		db = db.Where("status = ?", query.Status)
+	}
+
+	var total int64
+	if err := db.Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+
+	page := query.Page
+	if page < 1 {
+		page = 1
+	}
+	pageSize := query.PageSize
+	if pageSize < 1 {
+		pageSize = 10
+	}
+
+	var results []model.STR
+	db = applyResultOrder(db, query.Sort, query.Direction, map[string]string{
+		"gene": "gene", "chromosome": naturalChromosomeOrder("chromosome"), "position": "position", "status": "status",
+		"repeatCount": "ref_repeats", "reviewed": "reviewed", "focused": "focused",
+	}, "gene ASC", "position ASC")
+	err := db.Offset((page - 1) * pageSize).Limit(pageSize).Find(&results).Error
+	return results, total, err
+}
+
+func (r *ResultRepository) FindSTRByID(id string) (*model.STR, error) {
+	var result model.STR
+	err := r.db.Where("id = ?", id).First(&result).Error
+	return &result, err
+}
+
+func (r *ResultRepository) UpdateSTRReview(id string, reviewed bool, reviewer string) error {
+	return r.db.Model(&model.STR{}).Where("id = ?", id).Updates(map[string]interface{}{
+		"reviewed": reviewed, "reviewed_by": reviewer, "reviewed_at": reviewTimestamp(reviewed),
+	}).Error
+}
+
+func (r *ResultRepository) UpdateSTRFocus(id string, focused bool, focuser string) error {
+	return r.db.Model(&model.STR{}).Where("id = ?", id).Updates(map[string]interface{}{
+		"focused": focused, "focused_by": focuser,
+	}).Error
+}
+
+// ========== MEI ==========
+
+func (r *ResultRepository) PaginateMEIs(query *model.MEIListQuery) ([]model.MEIVariant, int64, error) {
+	db := scopedResultQuery(r.db.Model(&model.MEIVariant{}), query.TaskID, query.TenantID, query.ExecutionAttemptID)
+	if query.Search != "" {
+		s := "%" + query.Search + "%"
+		db = db.Where("gene LIKE ? OR chromosome LIKE ?", s, s)
+	}
+	if query.TEType != "" {
+		db = db.Where("te_type = ?", query.TEType)
+	}
+
+	var total int64
+	if err := db.Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+
+	page := query.Page
+	if page < 1 {
+		page = 1
+	}
+	pageSize := query.PageSize
+	if pageSize < 1 {
+		pageSize = 10
+	}
+
+	var results []model.MEIVariant
+	db = applyResultOrder(db, query.Sort, query.Direction, map[string]string{
+		"gene": "gene", "chromosome": naturalChromosomeOrder("chromosome"), "position": "position", "type": "te_type",
+		"meiType": "te_type", "length": "avg_soft_clip_length", "frequency": "gnomad_af",
+		"supportingReads": "supporting_reads", "reviewed": "reviewed", "focused": "focused",
+	}, naturalChromosomeOrder("chromosome")+" ASC", "position ASC")
+	err := db.Offset((page - 1) * pageSize).Limit(pageSize).Find(&results).Error
+	return results, total, err
+}
+
+func (r *ResultRepository) FindMEIByID(id string) (*model.MEIVariant, error) {
+	var result model.MEIVariant
+	err := r.db.Where("id = ?", id).First(&result).Error
+	return &result, err
+}
+
+func (r *ResultRepository) UpdateMEIReview(id string, reviewed bool, reviewer string) error {
+	return r.db.Model(&model.MEIVariant{}).Where("id = ?", id).Updates(map[string]interface{}{
+		"reviewed": reviewed, "reviewed_by": reviewer, "reviewed_at": reviewTimestamp(reviewed),
+	}).Error
+}
+
+func (r *ResultRepository) UpdateMEIFocus(id string, focused bool, focuser string) error {
+	return r.db.Model(&model.MEIVariant{}).Where("id = ?", id).Updates(map[string]interface{}{
+		"focused": focused, "focused_by": focuser,
+	}).Error
+}
+
+// ========== Mitochondrial ==========
+
+func (r *ResultRepository) PaginateMTVariants(query *model.MTListQuery) ([]model.MitochondrialVariant, int64, error) {
+	db := scopedResultQuery(r.db.Model(&model.MitochondrialVariant{}), query.TaskID, query.TenantID, query.ExecutionAttemptID)
+	if query.Search != "" {
+		s := "%" + query.Search + "%"
+		db = db.Where(
+			"gene LIKE ? OR mt_gene LIKE ? OR mitophen_phenotypes LIKE ? OR clinvar_dn LIKE ? OR ref LIKE ? OR alt LIKE ?",
+			s, s, s, s, s, s,
+		)
+	}
+	if query.Pathogenicity != "" {
+		pattern := "%" + strings.ToLower(strings.TrimSpace(query.Pathogenicity)) + "%"
+		db = db.Where("LOWER(clinvar_sig) LIKE ?", pattern)
+	}
+
+	var total int64
+	if err := db.Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+
+	page := query.Page
+	if page < 1 {
+		page = 1
+	}
+	pageSize := query.PageSize
+	if pageSize < 1 {
+		pageSize = 10
+	}
+
+	var results []model.MitochondrialVariant
+	db = applyResultOrder(db, query.Sort, query.Direction, map[string]string{
+		"position": "position", "gene": "mt_gene", "heteroplasmy": "heteroplasmy", "pathogenicity": "clinvar_sig",
+		"reviewed": "reviewed", "focused": "focused",
+	}, "position ASC")
+	err := db.Offset((page - 1) * pageSize).Limit(pageSize).Find(&results).Error
+	return results, total, err
+}
+
+func (r *ResultRepository) FindMTVariantByID(id string) (*model.MitochondrialVariant, error) {
+	var result model.MitochondrialVariant
+	err := r.db.Where("id = ?", id).First(&result).Error
+	return &result, err
+}
+
+func (r *ResultRepository) UpdateMTVariantReview(id string, reviewed bool, reviewer string) error {
+	return r.db.Model(&model.MitochondrialVariant{}).Where("id = ?", id).Updates(map[string]interface{}{
+		"reviewed": reviewed, "reviewed_by": reviewer, "reviewed_at": reviewTimestamp(reviewed),
+	}).Error
+}
+
+func (r *ResultRepository) UpdateMTVariantFocus(id string, focused bool, focuser string) error {
+	return r.db.Model(&model.MitochondrialVariant{}).Where("id = ?", id).Updates(map[string]interface{}{
+		"focused": focused, "focused_by": focuser,
+	}).Error
+}
+
+// ========== UPD ==========
+
+func (r *ResultRepository) PaginateUPDRegions(query *model.UPDListQuery) ([]model.UPDRegion, int64, error) {
+	db := scopedResultQuery(r.db.Model(&model.UPDRegion{}), query.TaskID, query.TenantID, query.ExecutionAttemptID)
+	if query.Search != "" {
+		s := "%" + query.Search + "%"
+		db = db.Where("chromosome LIKE ? OR genes LIKE ?", s, s)
+	}
+
+	var total int64
+	if err := db.Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+
+	page := query.Page
+	if page < 1 {
+		page = 1
+	}
+	pageSize := query.PageSize
+	if pageSize < 1 {
+		pageSize = 10
+	}
+
+	var results []model.UPDRegion
+	db = applyResultOrder(db, query.Sort, query.Direction, map[string]string{
+		"chromosome": naturalChromosomeOrder("chromosome"), "start": "start_position", "startPosition": "start_position",
+		"end": "end_position", "endPosition": "end_position", "length": "(end_position - start_position)", "type": "type",
+		"reviewed": "reviewed", "focused": "focused",
+	}, naturalChromosomeOrder("chromosome")+" ASC", "start_position ASC")
+	err := db.Offset((page - 1) * pageSize).Limit(pageSize).Find(&results).Error
+	return results, total, err
+}
+
+func (r *ResultRepository) FindUPDRegionByID(id string) (*model.UPDRegion, error) {
+	var result model.UPDRegion
+	err := r.db.Where("id = ?", id).First(&result).Error
+	return &result, err
+}
+
+func (r *ResultRepository) UpdateUPDRegionReview(id string, reviewed bool, reviewer string) error {
+	return r.db.Model(&model.UPDRegion{}).Where("id = ?", id).Updates(map[string]interface{}{
+		"reviewed": reviewed, "reviewed_by": reviewer, "reviewed_at": reviewTimestamp(reviewed),
+	}).Error
+}
+
+func (r *ResultRepository) UpdateUPDRegionFocus(id string, focused bool, focuser string) error {
+	return r.db.Model(&model.UPDRegion{}).Where("id = ?", id).Updates(map[string]interface{}{
+		"focused": focused, "focused_by": focuser,
+	}).Error
+}
+
+// ========== QC ==========
+
+func (r *ResultRepository) FindQCByTaskID(taskID string) (*model.QCResult, error) {
+	tenantID, attemptID := r.taskProvenance(taskID)
+	return r.FindQCByTaskScope(taskID, tenantID, attemptID)
+}
+
+func (r *ResultRepository) FindQCByTaskScope(taskID, tenantID, attemptID string) (*model.QCResult, error) {
+	var result model.QCResult
+	err := scopedResultQuery(r.db, taskID, tenantID, attemptID).Order("member_role ASC, member_id ASC, id ASC").First(&result).Error
+	return &result, err
+}
+
+// applyResultOrder accepts only a per-result-type column whitelist. It keeps a
+// stable ID tie breaker so pagination cannot shuffle equal rows between pages.
+func applyResultOrder(db *gorm.DB, sortKey, direction string, allowed map[string]string, defaults ...string) *gorm.DB {
+	direction = strings.ToUpper(strings.TrimSpace(direction))
+	if direction != "DESC" {
+		direction = "ASC"
+	}
+	if column, ok := allowed[sortKey]; ok {
+		return db.Order(column + " " + direction).Order("id ASC")
+	}
+	for _, order := range defaults {
+		db = db.Order(order)
+	}
+	return db.Order("id ASC")
+}
+
+func naturalChromosomeOrder(column string) string {
+	// column is always a repository constant, never an HTTP parameter.
+	normalized := fmt.Sprintf("regexp_replace(lower(%s), '^chr', '')", column)
+	return fmt.Sprintf("CASE WHEN %s ~ '^[0-9]+$' THEN (%s)::int WHEN %s = 'x' THEN 23 WHEN %s = 'y' THEN 24 WHEN %s IN ('m', 'mt') THEN 25 ELSE 1000 END", normalized, normalized, normalized, normalized, normalized)
+}
+
+const acmgClassificationOrder = "CASE acmg_classification WHEN 'Pathogenic' THEN 1 WHEN 'Likely_Pathogenic' THEN 2 WHEN 'VUS' THEN 3 WHEN 'Likely_Benign' THEN 4 WHEN 'Benign' THEN 5 ELSE 99 END"
+
+func (r *ResultRepository) taskProvenance(taskID string) (string, string) {
+	var task model.Task
+	if err := r.db.Select("uuid, tenant_id, external_org_id, created_by, execution_attempt_id").Where("uuid = ?", taskID).First(&task).Error; err != nil {
+		return "", ""
+	}
+	attemptID := task.ExecutionAttemptID
+	if attemptID == "" {
+		attemptID = task.UUID
+	}
+	return model.TenantIDForTask(&task), attemptID
+}
+
+func (r *ResultRepository) CreateQC(result *model.QCResult) error {
+	return r.db.Create(result).Error
+}
+
+// ========== Generic create for import ==========
+
+func (r *ResultRepository) CreateSNVIndels(results []model.SNVIndel) error {
+	if len(results) == 0 {
+		return nil
+	}
+	return r.db.CreateInBatches(results, 100).Error
+}
+
+func (r *ResultRepository) CreateCNVSegments(results []model.CNVSegment) error {
+	if len(results) == 0 {
+		return nil
+	}
+	return r.db.CreateInBatches(results, 100).Error
+}
+
+func (r *ResultRepository) CreateCNVExons(results []model.CNVExon) error {
+	if len(results) == 0 {
+		return nil
+	}
+	return r.db.CreateInBatches(results, 100).Error
+}
+
+func (r *ResultRepository) CreateSTRs(results []model.STR) error {
+	if len(results) == 0 {
+		return nil
+	}
+	return r.db.CreateInBatches(results, 100).Error
+}
+
+func (r *ResultRepository) CreateMEIs(results []model.MEIVariant) error {
+	if len(results) == 0 {
+		return nil
+	}
+	return r.db.CreateInBatches(results, 100).Error
+}
+
+func (r *ResultRepository) CreateMTVariants(results []model.MitochondrialVariant) error {
+	if len(results) == 0 {
+		return nil
+	}
+	return r.db.CreateInBatches(results, 100).Error
+}
+
+func (r *ResultRepository) CreateUPDRegions(results []model.UPDRegion) error {
+	if len(results) == 0 {
+		return nil
+	}
+	return r.db.CreateInBatches(results, 100).Error
+}
+
+// ========== ROH ==========
+
+func (r *ResultRepository) FindROHRegionsByTaskID(taskID string) ([]model.ROHRegion, error) {
+	var results []model.ROHRegion
+	err := r.db.Where("task_id = ?", taskID).Find(&results).Error
+	return results, err
+}
+
+func (r *ResultRepository) PaginateROHRegions(query *model.ROHListQuery) ([]model.ROHRegion, int64, error) {
+	db := scopedResultQuery(r.db.Model(&model.ROHRegion{}), query.TaskID, query.TenantID, query.ExecutionAttemptID)
+	if query.Search != "" {
+		s := "%" + query.Search + "%"
+		db = db.Where("chr LIKE ? OR recessive_genes LIKE ?", s, s)
+	}
+
+	var total int64
+	if err := db.Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+
+	page := query.Page
+	if page < 1 {
+		page = 1
+	}
+	pageSize := query.PageSize
+	if pageSize < 1 {
+		pageSize = 10
+	}
+
+	var results []model.ROHRegion
+	db = applyResultOrder(db, query.Sort, query.Direction, map[string]string{
+		"chromosome": naturalChromosomeOrder("chr"), "start": "begin", "startPosition": "begin", "end": "end", "endPosition": "end",
+		"size": "size_mb", "sizeMb": "size_mb", "variantCount": "nb_variants", "homozygosity": "percentage_homozygosity",
+		"reviewed": "reviewed", "focused": "focused",
+	}, naturalChromosomeOrder("chr")+" ASC", "begin ASC")
+	err := db.Offset((page - 1) * pageSize).Limit(pageSize).Find(&results).Error
+	return results, total, err
+}
+
+func (r *ResultRepository) CreateROHRegions(results []model.ROHRegion) error {
+	if len(results) == 0 {
+		return nil
+	}
+	return r.db.CreateInBatches(results, 100).Error
+}
+
+// ========== Delete by TaskID (for re-import) ==========
+
+func (r *ResultRepository) DeleteSNVIndelsByTaskID(taskID string) error {
+	return r.db.Where("task_id = ?", taskID).Delete(&model.SNVIndel{}).Error
+}
+
+func (r *ResultRepository) DeleteCNVSegmentsByTaskID(taskID string) error {
+	return r.db.Where("task_id = ?", taskID).Delete(&model.CNVSegment{}).Error
+}
+
+func (r *ResultRepository) DeleteCNVExonsByTaskID(taskID string) error {
+	return r.db.Where("task_id = ?", taskID).Delete(&model.CNVExon{}).Error
+}
+
+func (r *ResultRepository) DeleteSTRsByTaskID(taskID string) error {
+	return r.db.Where("task_id = ?", taskID).Delete(&model.STR{}).Error
+}
+
+func (r *ResultRepository) DeleteMEIsByTaskID(taskID string) error {
+	return r.db.Where("task_id = ?", taskID).Delete(&model.MEIVariant{}).Error
+}
+
+func (r *ResultRepository) DeleteMTVariantsByTaskID(taskID string) error {
+	return r.db.Where("task_id = ?", taskID).Delete(&model.MitochondrialVariant{}).Error
+}
+
+func (r *ResultRepository) DeleteUPDRegionsByTaskID(taskID string) error {
+	return r.db.Where("task_id = ?", taskID).Delete(&model.UPDRegion{}).Error
+}
+
+func (r *ResultRepository) DeleteROHRegionsByTaskID(taskID string) error {
+	return r.db.Where("task_id = ?", taskID).Delete(&model.ROHRegion{}).Error
+}
+
+func (r *ResultRepository) DeleteQCByTaskID(taskID string) error {
+	return r.db.Where("task_id = ?", taskID).Delete(&model.QCResult{}).Error
+}
+
+// DeleteTaskAttemptResults replaces only the current tenant/attempt read
+// projection. Review events are intentionally not touched.
+func (r *ResultRepository) DeleteTaskAttemptResults(taskID, tenantID, attemptID string) error {
+	models := []interface{}{
+		&model.SNVIndel{}, &model.CNVSegment{}, &model.CNVExon{}, &model.STR{},
+		&model.MEIVariant{}, &model.MitochondrialVariant{}, &model.UPDRegion{},
+		&model.ROHRegion{}, &model.QCResult{}, &model.CNVAssessment{},
+	}
+	for _, value := range models {
+		if err := r.db.Where("task_id = ? AND tenant_id = ? AND execution_attempt_id = ?", taskID, tenantID, attemptID).Delete(value).Error; err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ROH Review/Report
+func (r *ResultRepository) UpdateROHRegionReview(id string, reviewed bool, reviewer string) error {
+	return r.db.Model(&model.ROHRegion{}).Where("id = ?", id).Updates(map[string]interface{}{
+		"reviewed": reviewed, "reviewed_by": reviewer, "reviewed_at": reviewTimestamp(reviewed),
+	}).Error
+}
+
+func (r *ResultRepository) UpdateROHRegionFocus(id string, focused bool, focuser string) error {
+	return r.db.Model(&model.ROHRegion{}).Where("id = ?", id).Updates(map[string]interface{}{
+		"focused": focused, "focused_by": focuser,
+	}).Error
+}
+
+// ========== Generic variant operations ==========
+
+// variantModel maps variant type string to its GORM model for generic operations.
+var variantModel = map[string]interface{}{
+	"snv-indel":   &model.SNVIndel{},
+	"cnv-segment": &model.CNVSegment{},
+	"cnv-exon":    &model.CNVExon{},
+	"str":         &model.STR{},
+	"mei":         &model.MEIVariant{},
+	"mt":          &model.MitochondrialVariant{},
+	"upd":         &model.UPDRegion{},
+	"roh":         &model.ROHRegion{},
+}
+
+// UpdateVariantReview generically updates the review status of any variant type,
+// scoped to the current task to prevent cross-task variant ID tampering.
+func (r *ResultRepository) UpdateVariantReview(variantType, taskID, id string, reviewed bool, reviewer string) error {
+	m, ok := variantModel[variantType]
+	if !ok {
+		return fmt.Errorf("unknown variant type: %s", variantType)
+	}
+	tx := r.db.Model(m).Where("id = ? AND task_id = ?", id, taskID).Updates(map[string]interface{}{
+		"reviewed":    reviewed,
+		"reviewed_by": reviewer,
+		"reviewed_at": reviewTimestamp(reviewed),
+	})
+	if tx.Error != nil {
+		return tx.Error
+	}
+	if tx.RowsAffected == 0 {
+		return gorm.ErrRecordNotFound
+	}
+	return nil
+}
+
+func reviewTimestamp(reviewed bool) interface{} {
+	if !reviewed {
+		return nil
+	}
+	return time.Now().UTC()
+}
+
+// UpdateVariantFocus generically updates the focus status of any variant type,
+// scoped to the current task to prevent cross-task variant ID tampering.
+func (r *ResultRepository) UpdateVariantFocus(variantType, taskID, id string, focused bool, focuser string) error {
+	m, ok := variantModel[variantType]
+	if !ok {
+		return fmt.Errorf("unknown variant type: %s", variantType)
+	}
+	tx := r.db.Model(m).Where("id = ? AND task_id = ?", id, taskID).Updates(map[string]interface{}{
+		"focused":    focused,
+		"focused_by": focuser,
+	})
+	if tx.Error != nil {
+		return tx.Error
+	}
+	if tx.RowsAffected == 0 {
+		return gorm.ErrRecordNotFound
+	}
+	return nil
+}
+
+// VariantExists verifies the requested variant row belongs to the current task.
+func (r *ResultRepository) VariantExists(variantType, taskID, id string) (bool, error) {
+	m, ok := variantModel[variantType]
+	if !ok {
+		return false, fmt.Errorf("unknown variant type: %s", variantType)
+	}
+	var count int64
+	if err := r.db.Model(m).Where("id = ? AND task_id = ?", id, taskID).Count(&count).Error; err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+func (r *ResultRepository) VariantExistsScoped(variantType, taskID, tenantID, attemptID, id string) (bool, error) {
+	m, ok := variantModel[variantType]
+	if !ok {
+		return false, fmt.Errorf("unknown variant type: %s", variantType)
+	}
+	var count int64
+	if err := scopedResultQuery(r.db.Model(m), taskID, tenantID, attemptID).Where("id = ?", id).Count(&count).Error; err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+// ListCNVAssessments returns persisted CNV assessments scoped to a task and
+// result type. If ids is non-empty, only those variant IDs are returned.
+func (r *ResultRepository) ListCNVAssessments(taskID, variantType string, ids []string) ([]model.CNVAssessment, error) {
+	tenantID, attemptID := r.taskProvenance(taskID)
+	db := scopedResultQuery(r.db, taskID, tenantID, attemptID).Where("variant_type = ?", variantType)
+	if len(ids) > 0 {
+		db = db.Where("variant_id IN ?", ids)
+	}
+	var assessments []model.CNVAssessment
+	err := db.Order("updated_at DESC").Find(&assessments).Error
+	return assessments, err
+}
+
+func (r *ResultRepository) FindCNVAssessment(taskID, variantType, variantID string) (*model.CNVAssessment, error) {
+	tenantID, attemptID := r.taskProvenance(taskID)
+	return r.FindCNVAssessmentScoped(taskID, tenantID, attemptID, variantType, variantID)
+}
+
+// UpsertCNVAssessment inserts or replaces an assessment for one CNV variant.
+func (r *ResultRepository) UpsertCNVAssessment(taskID, variantType, variantID, payload, actor string) (*model.CNVAssessment, error) {
+	var task model.Task
+	if err := r.db.Where("uuid = ?", taskID).First(&task).Error; err != nil {
+		return nil, err
+	}
+	attemptID := task.ExecutionAttemptID
+	if attemptID == "" {
+		attemptID = task.UUID
+	}
+	return r.UpsertCNVAssessmentScoped(taskID, model.TenantIDForTask(&task), attemptID, variantType, variantID, payload, actor)
+}
+
+// UpsertCNVAssessmentScoped persists an assessment with the same provenance
+// scope as its source CNV result.
+func (r *ResultRepository) UpsertCNVAssessmentScoped(taskID, tenantID, attemptID, variantType, variantID, payload, actor string) (*model.CNVAssessment, error) {
+	assessment := model.CNVAssessment{
+		TenantID:           tenantID,
+		ExecutionAttemptID: attemptID,
+		ID:                 uuid.New().String(),
+		TaskID:             taskID,
+		VariantType:        variantType,
+		VariantID:          variantID,
+		PayloadJSON:        payload,
+		CreatedBy:          actor,
+		UpdatedBy:          actor,
+	}
+	if err := r.db.Clauses(clause.OnConflict{
+		Columns: []clause.Column{
+			{Name: "tenant_id"},
+			{Name: "task_id"},
+			{Name: "execution_attempt_id"},
+			{Name: "variant_type"},
+			{Name: "variant_id"},
+		},
+		DoUpdates: clause.Assignments(map[string]interface{}{
+			"payload_json": payload,
+			"updated_by":   actor,
+			"updated_at":   gorm.Expr("CURRENT_TIMESTAMP"),
+		}),
+	}).Create(&assessment).Error; err != nil {
+		return nil, err
+	}
+	return r.FindCNVAssessmentScoped(taskID, tenantID, attemptID, variantType, variantID)
+}
+
+func (r *ResultRepository) FindCNVAssessmentScoped(taskID, tenantID, attemptID, variantType, variantID string) (*model.CNVAssessment, error) {
+	var assessment model.CNVAssessment
+	err := r.db.Where(
+		"task_id = ? AND tenant_id = ? AND execution_attempt_id = ? AND variant_type = ? AND variant_id = ?",
+		taskID, tenantID, attemptID, variantType, variantID,
+	).First(&assessment).Error
+	return &assessment, err
+}

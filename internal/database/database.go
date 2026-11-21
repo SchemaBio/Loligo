@@ -1,0 +1,564 @@
+package database
+
+import (
+	"context"
+	"fmt"
+	"strings"
+
+	"github.com/SchemaBio/Loligo/internal/assistance"
+	"github.com/SchemaBio/Loligo/internal/config"
+	"github.com/SchemaBio/Loligo/internal/model"
+	"gorm.io/driver/postgres"
+	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
+)
+
+var DB *gorm.DB
+
+// InitDB initializes database connection based on config
+func InitDB(cfg *config.Config) error {
+	var err error
+
+	// Configure GORM logger
+	gormLogger := logger.Default.LogMode(logger.Info)
+	if cfg.Server.Mode == "release" {
+		gormLogger = logger.Default.LogMode(logger.Warn)
+	}
+
+	// Connect to PostgreSQL
+	DB, err = gorm.Open(postgres.Open(cfg.Database.DSN), &gorm.Config{
+		Logger: gormLogger,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to connect database: %w", err)
+	}
+
+	return nil
+}
+
+// AutoMigrate runs auto migration for all models
+func AutoMigrate() error {
+	if DB == nil {
+		return fmt.Errorf("database not initialized")
+	}
+
+	if err := migrateFocusNames(); err != nil {
+		return err
+	}
+	// Initialize token_version for existing users (NULL or 0 → 1)
+	DB.Exec("UPDATE users SET token_version = 1 WHERE token_version IS NULL OR token_version = 0")
+
+	err := DB.AutoMigrate(
+		&assistance.Settings{}, &assistance.Request{}, &assistance.SettingsEvent{}, &assistance.ProfileRecord{},
+		&model.CVMSubmission{}, &model.CVMCancellation{}, &model.ExecutionOutbox{},
+		// Core models
+		&model.RetentionJob{},
+		&model.User{},
+		&model.Task{},
+		&model.Sample{},
+		&model.Project{},
+		// Pedigree models
+		&model.Pedigree{},
+		&model.PedigreeMember{},
+		// Gene list models
+		&model.GeneList{},
+		// Pipeline models
+		&model.Pipeline{},
+		// Variant result models
+		&model.SNVIndel{},
+		&model.CNVSegment{},
+		&model.CNVExon{},
+		&model.STR{},
+		&model.MEIVariant{},
+		&model.MitochondrialVariant{},
+		&model.UPDRegion{},
+		&model.ROHRegion{},
+		&model.QCResult{},
+		&model.CNVAssessment{},
+		// Report models
+		&model.Report{},
+		&model.ReportTemplate{},
+		&model.ReportGeneration{},
+		&model.ResultPackage{},
+		&model.ResultDownload{},
+		&model.BAMRetentionJob{},
+		&model.BAMRetentionEvent{},
+		&model.RawResultPackage{},
+		// Upload models
+		&model.UploadJob{},
+		&model.UploadFile{},
+		&model.UploadMultipartSession{},
+		&model.UploadMultipartPart{},
+		&model.DataAsset{},
+		&model.SampleDataLink{},
+		&model.TaskDataAsset{},
+		&model.CNVBaseline{},
+		&model.CNVBaselineReadPair{},
+		&model.WorkflowThresholdConfig{},
+		// Import audit models
+		&model.ResultImportBatch{},
+		&model.VariantReviewEvent{},
+		&model.ResultDataset{},
+		&model.IGVSnapshot{},
+		&model.ResultAssessmentContext{},
+		&model.ResultAssessmentArtifact{},
+		&model.ResultSavedView{},
+		&model.ResultLegacyRowMapping{},
+		&model.ResultRowAutomaticAssessment{},
+		&model.ResultRowAdjustment{},
+		&model.ResultRowAdjustmentEvent{},
+		&model.HistoryScopeRevision{},
+		&model.HistoryFocus{},
+	)
+	if err != nil {
+		return fmt.Errorf("failed to auto migrate: %w", err)
+	}
+	if err := DB.Exec("ALTER TABLE cnv_baselines ALTER COLUMN task_uuid DROP NOT NULL").Error; err != nil {
+		return err
+	}
+	if err := migrateReportProtocol(); err != nil {
+		return err
+	}
+	for _, sql := range []string{
+		"CREATE UNIQUE INDEX IF NOT EXISTS gene_lists_org_name ON gene_lists(external_org_id,lower(name)) WHERE external_org_id<>''",
+		"CREATE UNIQUE INDEX IF NOT EXISTS gene_lists_user_name ON gene_lists(created_by,lower(name)) WHERE external_org_id=''",
+		"CREATE UNIQUE INDEX IF NOT EXISTS report_templates_user_name ON report_templates(owner_user_id,lower(name)) WHERE external_org_id=''",
+		"DROP INDEX IF EXISTS idx_report_templates_owner_name",
+		"CREATE UNIQUE INDEX IF NOT EXISTS report_templates_org_name ON report_templates(external_org_id,lower(name)) WHERE external_org_id<>''",
+	} {
+		if err := DB.Exec(sql).Error; err != nil {
+			return fmt.Errorf("resource scope index: %w", err)
+		}
+	}
+	if err := migrateResultImportStorage(); err != nil {
+		return err
+	}
+	if err := DB.Exec("CREATE UNIQUE INDEX IF NOT EXISTS upload_multipart_active_file_idx ON upload_multipart_sessions (file_uuid) WHERE status = 'active'").Error; err != nil {
+		return fmt.Errorf("failed to create multipart session index: %w", err)
+	}
+	if err := migrateSampleOrganizationIndexes(); err != nil {
+		return err
+	}
+	if err := migrateTaskExecutionColumns(); err != nil {
+		return err
+	}
+	if err := preserveBEDDataAssets(); err != nil {
+		return err
+	}
+	if err := migrateAuditScope(); err != nil {
+		return err
+	}
+	if err := migrateQCMemberScope(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func migrateResultImportStorage() error {
+	if DB == nil {
+		return fmt.Errorf("database not initialized")
+	}
+	for _, column := range []string{"pangolin_an", "evo_score_an"} {
+		if err := DB.Exec(fmt.Sprintf(`ALTER TABLE result_snv_indels ALTER COLUMN %s TYPE TEXT USING %s::text`, column, column)).Error; err != nil {
+			return fmt.Errorf("failed to preserve functional annotation labels: %w", err)
+		}
+	}
+	if err := DB.Exec(`ALTER TABLE result_snv_indels ALTER COLUMN alpha_missense_amc TYPE TEXT USING alpha_missense_amc::text`).Error; err != nil {
+		return fmt.Errorf("failed to expand AlphaMissense annotation storage: %w", err)
+	}
+	if err := DB.Exec(`ALTER TABLE result_snv_indels ALTER COLUMN clinvar_dn TYPE TEXT USING clinvar_dn::text`).Error; err != nil {
+		return fmt.Errorf("failed to expand ClinVar disease annotation storage: %w", err)
+	}
+	if err := DB.Exec(`ALTER TABLE result_import_batches ALTER COLUMN object_keys_json SET DEFAULT '[]'::jsonb`).Error; err != nil {
+		return fmt.Errorf("failed to set import object key default: %w", err)
+	}
+	if err := DB.Exec(`ALTER TABLE result_import_batches ALTER COLUMN counts_json SET DEFAULT '{}'::jsonb`).Error; err != nil {
+		return fmt.Errorf("failed to set import counts default: %w", err)
+	}
+	return nil
+}
+
+// migrateAuditScope backfills the canonical tenant/attempt columns and
+// creates one append-only legacy review event for existing reviewed rows. It
+// is intentionally idempotent: result IDs are used as legacy event IDs.
+func migrateAuditScope() error {
+	if DB == nil {
+		return fmt.Errorf("database not initialized")
+	}
+	// A clean release schema has no legacy reviewed rows and therefore does not
+	// need the pgcrypto helper used solely by the legacy backfill below.  The
+	// extension may already exist in an older schema in the same database; an
+	// application role for this release must not be granted access to that old
+	// business schema just to create an unused helper.
+	legacyReviewed := false
+	for _, table := range []string{
+		"result_snv_indels", "result_cnv_segments", "result_cnv_exons", "result_strs",
+		"result_mei_variants", "result_mt_variants", "result_upd_regions", "result_roh_regions",
+	} {
+		var exists bool
+		if err := DB.Raw(fmt.Sprintf(`SELECT EXISTS (SELECT 1 FROM %s WHERE reviewed = TRUE)`, table)).Scan(&exists).Error; err != nil {
+			return fmt.Errorf("failed to inspect legacy review rows in %s: %w", table, err)
+		}
+		if exists {
+			legacyReviewed = true
+			break
+		}
+	}
+	if legacyReviewed {
+		if err := DB.Exec(`CREATE EXTENSION IF NOT EXISTS pgcrypto`).Error; err != nil {
+			return fmt.Errorf("failed to enable SHA-256 support: %w", err)
+		}
+		if err := DB.Exec(`CREATE OR REPLACE FUNCTION audit_sha256(value text) RETURNS text AS $$ SELECT encode(digest(value, 'sha256'), 'hex') $$ LANGUAGE sql IMMUTABLE`).Error; err != nil {
+			return fmt.Errorf("failed to create audit fingerprint helper: %w", err)
+		}
+	}
+	if err := DB.Exec(`UPDATE tasks SET tenant_id = CASE WHEN NULLIF(external_org_id, '') IS NOT NULL THEN 'org:' || external_org_id WHEN created_by <> 0 THEN 'user:' || created_by::text ELSE NULL END WHERE tenant_id IS NULL OR tenant_id = '' OR tenant_id = 'user:0'`).Error; err != nil {
+		return fmt.Errorf("failed to backfill task tenant IDs: %w", err)
+	}
+	var missing int64
+	if err := DB.Model(&model.Task{}).Where("tenant_id IS NULL OR tenant_id = ''").Count(&missing).Error; err != nil {
+		return fmt.Errorf("failed to validate task tenant IDs: %w", err)
+	}
+	if missing > 0 {
+		var taskIDs []string
+		_ = DB.Raw(`SELECT uuid FROM tasks WHERE tenant_id IS NULL OR tenant_id = '' LIMIT 20`).Scan(&taskIDs).Error
+		return fmt.Errorf("cannot migrate audit scope: %d tasks have no resolvable tenant (task UUIDs: %s)", missing, strings.Join(taskIDs, ", "))
+	}
+	if err := DB.Exec(`ALTER TABLE tasks ALTER COLUMN tenant_id SET NOT NULL`).Error; err != nil {
+		return fmt.Errorf("failed to enforce tasks tenant scope: %w", err)
+	}
+
+	resultTables := []string{
+		"result_snv_indels", "result_cnv_segments", "result_cnv_exons", "result_strs",
+		"result_mei_variants", "result_mt_variants", "result_upd_regions", "result_roh_regions",
+		"result_qc", "cnv_assessments",
+	}
+	for _, table := range resultTables {
+		if err := DB.Exec(fmt.Sprintf(`UPDATE %s r SET tenant_id = t.tenant_id, execution_attempt_id = COALESCE(NULLIF(r.execution_attempt_id, ''), COALESCE(NULLIF(t.execution_attempt_id, ''), t.uuid)) FROM tasks t WHERE t.uuid = r.task_id AND (r.tenant_id IS NULL OR r.tenant_id = '' OR r.execution_attempt_id IS NULL OR r.execution_attempt_id = '')`, table)).Error; err != nil {
+			return fmt.Errorf("failed to backfill %s provenance: %w", table, err)
+		}
+		var orphanIDs []string
+		if err := DB.Raw(fmt.Sprintf(`SELECT id::text FROM %s WHERE tenant_id IS NULL OR tenant_id = '' OR execution_attempt_id IS NULL OR execution_attempt_id = '' LIMIT 20`, table)).Scan(&orphanIDs).Error; err != nil {
+			return fmt.Errorf("failed to validate %s provenance: %w", table, err)
+		}
+		if len(orphanIDs) > 0 {
+			return fmt.Errorf("cannot migrate audit scope: %s rows have no resolvable task tenant/attempt (ids: %s)", table, strings.Join(orphanIDs, ", "))
+		}
+		if err := DB.Exec(fmt.Sprintf(`ALTER TABLE %s ALTER COLUMN tenant_id SET NOT NULL`, table)).Error; err != nil {
+			return fmt.Errorf("failed to enforce %s tenant scope: %w", table, err)
+		}
+		if err := DB.Exec(fmt.Sprintf(`ALTER TABLE %s ALTER COLUMN execution_attempt_id SET NOT NULL`, table)).Error; err != nil {
+			return fmt.Errorf("failed to enforce %s execution attempt scope: %w", table, err)
+		}
+	}
+	if err := DB.Exec(`UPDATE result_import_batches b SET tenant_id = t.tenant_id, execution_attempt_id = COALESCE(NULLIF(b.execution_attempt_id, ''), COALESCE(NULLIF(t.execution_attempt_id, ''), t.uuid)) FROM tasks t WHERE t.uuid = b.task_uuid AND (b.tenant_id IS NULL OR b.tenant_id = '' OR b.execution_attempt_id IS NULL OR b.execution_attempt_id = '')`).Error; err != nil {
+		return fmt.Errorf("failed to backfill import batch provenance: %w", err)
+	}
+	var missingBatches int64
+	if err := DB.Raw(`SELECT COUNT(*) FROM result_import_batches WHERE tenant_id IS NULL OR tenant_id = '' OR execution_attempt_id IS NULL OR execution_attempt_id = ''`).Scan(&missingBatches).Error; err != nil {
+		return fmt.Errorf("failed to validate import batch provenance: %w", err)
+	}
+	if missingBatches > 0 {
+		var batchIDs []string
+		_ = DB.Raw(`SELECT id::text || ':' || task_uuid FROM result_import_batches WHERE tenant_id IS NULL OR tenant_id = '' OR execution_attempt_id IS NULL OR execution_attempt_id = '' LIMIT 20`).Scan(&batchIDs).Error
+		return fmt.Errorf("cannot migrate audit scope: %d import batches have no resolvable tenant/attempt (batch:task IDs: %s)", missingBatches, strings.Join(batchIDs, ", "))
+	}
+	if err := DB.Exec(`ALTER TABLE result_import_batches ALTER COLUMN tenant_id SET NOT NULL`).Error; err != nil {
+		return fmt.Errorf("failed to enforce import batch tenant scope: %w", err)
+	}
+	if err := DB.Exec(`ALTER TABLE result_import_batches ALTER COLUMN execution_attempt_id SET NOT NULL`).Error; err != nil {
+		return fmt.Errorf("failed to enforce import batch execution attempt scope: %w", err)
+	}
+	// Older releases used task_id alone for these projections.  Drop those
+	// indexes before creating the attempt-scoped keys generated by AutoMigrate.
+	for _, statement := range []string{
+		`DROP INDEX IF EXISTS idx_result_qc_task_id`,
+		`DROP INDEX IF EXISTS uni_result_qc_task_id`,
+		`DROP INDEX IF EXISTS result_qc_task_id_key`,
+		`DROP INDEX IF EXISTS idx_cnv_assessment_variant`,
+	} {
+		if err := DB.Exec(statement).Error; err != nil {
+			return fmt.Errorf("failed to replace result uniqueness indexes: %w", err)
+		}
+	}
+	if err := DB.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_result_qc_attempt ON result_qc (tenant_id, task_id, execution_attempt_id)`).Error; err != nil {
+		return fmt.Errorf("failed to create QC attempt index: %w", err)
+	}
+	if err := DB.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_cnv_assessment_variant ON cnv_assessments (tenant_id, task_id, execution_attempt_id, variant_type, variant_id)`).Error; err != nil {
+		return fmt.Errorf("failed to create CNV assessment attempt index: %w", err)
+	}
+	if err := DB.Exec(`ALTER TABLE cnv_assessments ALTER COLUMN tenant_id SET NOT NULL`).Error; err != nil {
+		return fmt.Errorf("failed to enforce CNV assessment tenant scope: %w", err)
+	}
+	if err := DB.Exec(`ALTER TABLE cnv_assessments ALTER COLUMN execution_attempt_id SET NOT NULL`).Error; err != nil {
+		return fmt.Errorf("failed to enforce CNV assessment execution attempt scope: %w", err)
+	}
+
+	legacyStatements := []string{
+		`INSERT INTO variant_review_events (id, tenant_id, task_uuid, execution_attempt_id, variant_type, variant_id, variant_fingerprint, history_group_key, action, actor_email, reference_genome, task_name, pipeline, pipeline_version, sample_id, internal_id, occurred_at, timestamp_known, recorded_at, variant_snapshot_json)
+		 SELECT r.id, t.tenant_id, r.task_id, COALESCE(NULLIF(r.execution_attempt_id, ''), t.uuid), 'snv-indel', r.id,
+		 audit_sha256(concat_ws('|','snv-indel',COALESCE(t.input_json->>'reference_genome',''),r.chromosome,r.position,r.ref,r.alt)),
+		 concat_ws('|','snv-indel',COALESCE(t.input_json->>'reference_genome',''),r.gene,r.hgv_sc,r.hgv_sp), 'REVIEWED', r.reviewed_by,
+		 COALESCE(t.input_json->>'reference_genome',''), t.name, t.pipeline, t.pipeline_version, t.sample_id, t.internal_id, r.reviewed_at, r.reviewed_at IS NOT NULL, NOW(), to_jsonb(r)
+		 FROM result_snv_indels r JOIN tasks t ON t.uuid=r.task_id WHERE r.reviewed=true ON CONFLICT (id) DO NOTHING`,
+		`INSERT INTO variant_review_events (id, tenant_id, task_uuid, execution_attempt_id, variant_type, variant_id, variant_fingerprint, history_group_key, action, actor_email, reference_genome, task_name, pipeline, pipeline_version, sample_id, internal_id, occurred_at, timestamp_known, recorded_at, variant_snapshot_json)
+		 SELECT r.id, t.tenant_id, r.task_id, COALESCE(NULLIF(r.execution_attempt_id, ''), t.uuid), 'cnv-segment', r.id,
+		 audit_sha256(concat_ws('|','cnv-segment',COALESCE(t.input_json->>'reference_genome',''),r.chromosome,r.start_position,r.end_position,r.type)),
+		 concat_ws('|','cnv-segment',COALESCE(t.input_json->>'reference_genome',''),r.chromosome,r.start_position,r.end_position,r.type), 'REVIEWED', r.reviewed_by,
+		 COALESCE(t.input_json->>'reference_genome',''), t.name, t.pipeline, t.pipeline_version, t.sample_id, t.internal_id, r.reviewed_at, r.reviewed_at IS NOT NULL, NOW(), to_jsonb(r)
+		 FROM result_cnv_segments r JOIN tasks t ON t.uuid=r.task_id WHERE r.reviewed=true ON CONFLICT (id) DO NOTHING`,
+		`INSERT INTO variant_review_events (id, tenant_id, task_uuid, execution_attempt_id, variant_type, variant_id, variant_fingerprint, history_group_key, action, actor_email, reference_genome, task_name, pipeline, pipeline_version, sample_id, internal_id, occurred_at, timestamp_known, recorded_at, variant_snapshot_json)
+		 SELECT r.id, t.tenant_id, r.task_id, COALESCE(NULLIF(r.execution_attempt_id, ''), t.uuid), 'cnv-exon', r.id,
+		 audit_sha256(concat_ws('|','cnv-exon',COALESCE(t.input_json->>'reference_genome',''),r.chromosome,r.start_position,r.end_position,r.gene,r.transcript,r.type)),
+		 concat_ws('|','cnv-exon',COALESCE(t.input_json->>'reference_genome',''),r.gene,r.transcript,r.exon_count,r.type), 'REVIEWED', r.reviewed_by,
+		 COALESCE(t.input_json->>'reference_genome',''), t.name, t.pipeline, t.pipeline_version, t.sample_id, t.internal_id, r.reviewed_at, r.reviewed_at IS NOT NULL, NOW(), to_jsonb(r)
+		 FROM result_cnv_exons r JOIN tasks t ON t.uuid=r.task_id WHERE r.reviewed=true ON CONFLICT (id) DO NOTHING`,
+		`INSERT INTO variant_review_events (id, tenant_id, task_uuid, execution_attempt_id, variant_type, variant_id, variant_fingerprint, history_group_key, action, actor_email, reference_genome, task_name, pipeline, pipeline_version, sample_id, internal_id, occurred_at, timestamp_known, recorded_at, variant_snapshot_json)
+		 SELECT r.id, t.tenant_id, r.task_id, COALESCE(NULLIF(r.execution_attempt_id, ''), t.uuid), 'str', r.id,
+		 audit_sha256(concat_ws('|','str',COALESCE(t.input_json->>'reference_genome',''),r.chromosome,r.position,r.repeat_unit)),
+		 concat_ws('|','str',COALESCE(t.input_json->>'reference_genome',''),r.gene,r.chromosome,r.position,r.repeat_unit,r.status), 'REVIEWED', r.reviewed_by,
+		 COALESCE(t.input_json->>'reference_genome',''), t.name, t.pipeline, t.pipeline_version, t.sample_id, t.internal_id, r.reviewed_at, r.reviewed_at IS NOT NULL, NOW(), to_jsonb(r)
+		 FROM result_strs r JOIN tasks t ON t.uuid=r.task_id WHERE r.reviewed=true ON CONFLICT (id) DO NOTHING`,
+		`INSERT INTO variant_review_events (id, tenant_id, task_uuid, execution_attempt_id, variant_type, variant_id, variant_fingerprint, history_group_key, action, actor_email, reference_genome, task_name, pipeline, pipeline_version, sample_id, internal_id, occurred_at, timestamp_known, recorded_at, variant_snapshot_json)
+		 SELECT r.id, t.tenant_id, r.task_id, COALESCE(NULLIF(r.execution_attempt_id, ''), t.uuid), 'mei', r.id,
+		 audit_sha256(concat_ws('|','mei',COALESCE(t.input_json->>'reference_genome',''),r.chromosome,r.position,r.te_type)),
+		 concat_ws('|','mei',COALESCE(t.input_json->>'reference_genome',''),r.chromosome,r.position,r.gene,r.te_type), 'REVIEWED', r.reviewed_by,
+		 COALESCE(t.input_json->>'reference_genome',''), t.name, t.pipeline, t.pipeline_version, t.sample_id, t.internal_id, r.reviewed_at, r.reviewed_at IS NOT NULL, NOW(), to_jsonb(r)
+		 FROM result_mei_variants r JOIN tasks t ON t.uuid=r.task_id WHERE r.reviewed=true ON CONFLICT (id) DO NOTHING`,
+		`INSERT INTO variant_review_events (id, tenant_id, task_uuid, execution_attempt_id, variant_type, variant_id, variant_fingerprint, history_group_key, action, actor_email, reference_genome, task_name, pipeline, pipeline_version, sample_id, internal_id, occurred_at, timestamp_known, recorded_at, variant_snapshot_json)
+		 SELECT r.id, t.tenant_id, r.task_id, COALESCE(NULLIF(r.execution_attempt_id, ''), t.uuid), 'mt', r.id,
+		 audit_sha256(concat_ws('|','mt',COALESCE(t.input_json->>'reference_genome',''),r.position,r.ref,r.alt)),
+		 concat_ws('|','mt',COALESCE(t.input_json->>'reference_genome',''),r.position,r.ref,r.alt), 'REVIEWED', r.reviewed_by,
+		 COALESCE(t.input_json->>'reference_genome',''), t.name, t.pipeline, t.pipeline_version, t.sample_id, t.internal_id, r.reviewed_at, r.reviewed_at IS NOT NULL, NOW(), to_jsonb(r)
+		 FROM result_mt_variants r JOIN tasks t ON t.uuid=r.task_id WHERE r.reviewed=true ON CONFLICT (id) DO NOTHING`,
+		`INSERT INTO variant_review_events (id, tenant_id, task_uuid, execution_attempt_id, variant_type, variant_id, variant_fingerprint, history_group_key, action, actor_email, reference_genome, task_name, pipeline, pipeline_version, sample_id, internal_id, occurred_at, timestamp_known, recorded_at, variant_snapshot_json)
+		 SELECT r.id, t.tenant_id, r.task_id, COALESCE(NULLIF(r.execution_attempt_id, ''), t.uuid), 'upd', r.id,
+		 audit_sha256(concat_ws('|','upd',COALESCE(t.input_json->>'reference_genome',''),r.chromosome,r.start_position,r.end_position,r.type)),
+		 concat_ws('|','upd',COALESCE(t.input_json->>'reference_genome',''),r.chromosome,r.start_position,r.end_position,r.type), 'REVIEWED', r.reviewed_by,
+		 COALESCE(t.input_json->>'reference_genome',''), t.name, t.pipeline, t.pipeline_version, t.sample_id, t.internal_id, r.reviewed_at, r.reviewed_at IS NOT NULL, NOW(), to_jsonb(r)
+		 FROM result_upd_regions r JOIN tasks t ON t.uuid=r.task_id WHERE r.reviewed=true ON CONFLICT (id) DO NOTHING`,
+		`INSERT INTO variant_review_events (id, tenant_id, task_uuid, execution_attempt_id, variant_type, variant_id, variant_fingerprint, history_group_key, action, actor_email, reference_genome, task_name, pipeline, pipeline_version, sample_id, internal_id, occurred_at, timestamp_known, recorded_at, variant_snapshot_json)
+		 SELECT r.id, t.tenant_id, r.task_id, COALESCE(NULLIF(r.execution_attempt_id, ''), t.uuid), 'roh', r.id,
+		 audit_sha256(concat_ws('|','roh',COALESCE(t.input_json->>'reference_genome',''),r.chr,r.begin,r.end)),
+		 concat_ws('|','roh',COALESCE(t.input_json->>'reference_genome',''),r.chr,r.begin,r.end), 'REVIEWED', r.reviewed_by,
+		 COALESCE(t.input_json->>'reference_genome',''), t.name, t.pipeline, t.pipeline_version, t.sample_id, t.internal_id, r.reviewed_at, r.reviewed_at IS NOT NULL, NOW(), to_jsonb(r)
+		 FROM result_roh_regions r JOIN tasks t ON t.uuid=r.task_id WHERE r.reviewed=true ON CONFLICT (id) DO NOTHING`,
+	}
+	if legacyReviewed {
+		for _, statement := range legacyStatements {
+			if err := DB.Exec(statement).Error; err != nil {
+				return fmt.Errorf("failed to bootstrap review events: %w", err)
+			}
+		}
+	}
+	if err := DB.Exec(`CREATE OR REPLACE FUNCTION prevent_variant_review_event_mutation() RETURNS trigger AS $$ BEGIN
+ IF TG_OP='DELETE' AND current_setting('research.expiry_task',true)=OLD.task_uuid AND EXISTS(SELECT 1 FROM tasks WHERE uuid=OLD.task_uuid AND expires_at<=clock_timestamp()) THEN RETURN OLD; END IF;
+ RAISE EXCEPTION 'variant review events are append-only'; END; $$ LANGUAGE plpgsql`).Error; err != nil {
+		return fmt.Errorf("failed to create review event guard: %w", err)
+	}
+	if err := DB.Exec(`DROP TRIGGER IF EXISTS variant_review_events_append_only ON variant_review_events`).Error; err != nil {
+		return fmt.Errorf("failed to reset review event guard: %w", err)
+	}
+	if err := DB.Exec(`CREATE TRIGGER variant_review_events_append_only BEFORE UPDATE OR DELETE ON variant_review_events FOR EACH ROW EXECUTE FUNCTION prevent_variant_review_event_mutation()`).Error; err != nil {
+		return fmt.Errorf("failed to enable review event guard: %w", err)
+	}
+	for _, statement := range []string{
+		`CREATE INDEX IF NOT EXISTS idx_variant_review_events_scope ON variant_review_events (tenant_id, variant_type, execution_attempt_id, variant_fingerprint, recorded_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_variant_review_events_task_timeline ON variant_review_events (tenant_id, task_uuid, variant_type, variant_fingerprint, recorded_at DESC)`,
+	} {
+		if err := DB.Exec(statement).Error; err != nil {
+			return fmt.Errorf("failed to create review event indexes: %w", err)
+		}
+	}
+	return nil
+}
+
+// migrateQCMemberScope upgrades the former one-QC-record-per-attempt key to
+// an explicit member scoped key. Existing imported records are retained as an
+// unknown legacy member instead of being guessed to belong to a family role.
+func migrateQCMemberScope() error {
+	if DB == nil {
+		return fmt.Errorf("database not initialized")
+	}
+	for _, statement := range []string{
+		`ALTER TABLE result_qc ADD COLUMN IF NOT EXISTS member_id varchar(100)`,
+		`ALTER TABLE result_qc ADD COLUMN IF NOT EXISTS member_role varchar(30)`,
+		`ALTER TABLE result_qc ADD COLUMN IF NOT EXISTS metric_availability jsonb`,
+		`UPDATE result_qc SET member_id = COALESCE(NULLIF(member_id, ''), NULLIF(sample_id, ''), 'legacy:unknown') WHERE member_id IS NULL OR member_id = ''`,
+		`UPDATE result_qc SET member_role = COALESCE(NULLIF(member_role, ''), 'unknown') WHERE member_role IS NULL OR member_role = ''`,
+		`DROP INDEX IF EXISTS idx_result_qc_attempt`,
+		`CREATE UNIQUE INDEX idx_result_qc_attempt ON result_qc (tenant_id, task_id, execution_attempt_id, member_id)`,
+	} {
+		if err := DB.Exec(statement).Error; err != nil {
+			return fmt.Errorf("failed to migrate QC member scope: %w", err)
+		}
+	}
+	return nil
+}
+
+// BackfillAuditEvents is used by the development seed command after inserting
+// demo results so those reviewed rows participate in /history immediately.
+func BackfillAuditEvents() error { return migrateAuditScope() }
+
+func preserveBEDDataAssets() error {
+	if err := DB.Exec("UPDATE data_assets SET expires_at = NULL WHERE read_type = ? AND expires_at IS NOT NULL", model.ReadTypeBed).Error; err != nil {
+		return fmt.Errorf("failed to remove BED data retention expiry: %w", err)
+	}
+	return nil
+}
+
+func migrateTaskExecutionColumns() error {
+	statements := []string{
+		// These columns were introduced after the original task schema. GORM's
+		// AutoMigrate adds them for new databases, but existing rows can still
+		// contain NULL when the column was added without a database default. The
+		// application scans the version and reason fields into Go value types, so
+		// make the zero values explicit before any worker starts using them.
+		"ALTER TABLE tasks ADD COLUMN IF NOT EXISTS version bigint DEFAULT 0",
+		"ALTER TABLE tasks ADD COLUMN IF NOT EXISTS last_cvm_event_version bigint DEFAULT 0",
+		"ALTER TABLE tasks ADD COLUMN IF NOT EXISTS execution_phase varchar(32) DEFAULT ''",
+		"ALTER TABLE tasks ADD COLUMN IF NOT EXISTS execution_reason_code varchar(120) DEFAULT ''",
+		"ALTER TABLE tasks ADD COLUMN IF NOT EXISTS phase_updated_at timestamptz",
+		"ALTER TABLE tasks ADD COLUMN IF NOT EXISTS sepiida_first_report_expected_at timestamptz",
+		"ALTER TABLE tasks ADD COLUMN IF NOT EXISTS sepiida_query_degraded_at timestamptz",
+		"ALTER TABLE tasks ADD COLUMN IF NOT EXISTS bootstrap_phase varchar(32) DEFAULT ''",
+		"ALTER TABLE tasks ADD COLUMN IF NOT EXISTS bootstrap_last_heartbeat_at timestamptz",
+		"ALTER TABLE tasks ADD COLUMN IF NOT EXISTS diagnostic_hold_until timestamptz",
+		"ALTER TABLE tasks ADD COLUMN IF NOT EXISTS diagnostic_summary varchar(1000) DEFAULT ''",
+		"ALTER TABLE tasks ADD COLUMN IF NOT EXISTS cvm_archive_staged_at timestamptz",
+		"ALTER TABLE tasks ADD COLUMN IF NOT EXISTS cvm_archive_termination_notified_at timestamptz",
+	}
+	for _, statement := range statements {
+		if err := DB.Exec(statement).Error; err != nil {
+			return fmt.Errorf("failed to migrate task execution columns: %w", err)
+		}
+	}
+	if err := DB.Exec("UPDATE tasks SET version = 0 WHERE version IS NULL").Error; err != nil {
+		return fmt.Errorf("failed to backfill task versions: %w", err)
+	}
+	// Earlier GORM naming split CVM into c_vm while SQL recovery used cvm.
+	// Retain both historical columns for rollback and preserve the newest fence.
+	if DB.Migrator().HasColumn(&model.Task{}, "last_c_vm_event_version") {
+		if err := DB.Exec("UPDATE tasks SET last_cvm_event_version = GREATEST(COALESCE(last_cvm_event_version, 0), COALESCE(last_c_vm_event_version, 0)) WHERE COALESCE(last_c_vm_event_version, 0) > COALESCE(last_cvm_event_version, 0)").Error; err != nil {
+			return fmt.Errorf("failed to reconcile legacy CVM event versions: %w", err)
+		}
+	}
+	if err := DB.Exec("UPDATE tasks SET last_cvm_event_version = 0 WHERE last_cvm_event_version IS NULL").Error; err != nil {
+		return fmt.Errorf("failed to backfill CVM event versions: %w", err)
+	}
+	if err := DB.Exec("UPDATE tasks SET execution_phase = '' WHERE execution_phase IS NULL").Error; err != nil {
+		return fmt.Errorf("failed to backfill execution phases: %w", err)
+	}
+	if err := DB.Exec("UPDATE tasks SET execution_reason_code = '' WHERE execution_reason_code IS NULL").Error; err != nil {
+		return fmt.Errorf("failed to backfill execution reason codes: %w", err)
+	}
+	if err := DB.Exec("UPDATE tasks SET bootstrap_phase = '' WHERE bootstrap_phase IS NULL").Error; err != nil {
+		return fmt.Errorf("failed to backfill bootstrap phases: %w", err)
+	}
+	if err := DB.Exec("UPDATE tasks SET diagnostic_summary = '' WHERE diagnostic_summary IS NULL").Error; err != nil {
+		return fmt.Errorf("failed to backfill diagnostic summaries: %w", err)
+	}
+	if err := DB.Exec(`UPDATE tasks SET sepiida_first_report_expected_at = COALESCE(started_at, phase_updated_at)
+		WHERE executor = 'cvm_spot' AND execution_phase IN ('running', 'archiving') AND sepiida_first_report_expected_at IS NULL`).Error; err != nil {
+		return fmt.Errorf("failed to backfill Sepiida first-report deadlines: %w", err)
+	}
+	// Preserve a useful phase for in-flight CVM attempts created before the
+	// phase column existed. Terminal records are fenced from late callbacks;
+	// running records remain visible as running; queued attempts are sent back
+	// through the durable dispatcher on the next start/recovery pass.
+	if err := DB.Exec(`UPDATE tasks
+		SET execution_phase = CASE
+			WHEN executor = 'cvm_spot' AND status IN ('completed', 'failed', 'cancelled', 'pending_interpretation') THEN 'terminal'
+			WHEN executor = 'cvm_spot' AND status = 'running' THEN 'running'
+			WHEN executor = 'cvm_spot' AND COALESCE(execution_attempt_id, '') <> ''
+				THEN CASE WHEN UPPER(COALESCE(vm_status, '')) IN ('DISPATCHING', 'WAITING_QUOTA', 'WAITING_CAPACITY') THEN 'dispatching' ELSE 'bootstrapping' END
+			ELSE 'idle'
+		END
+		WHERE execution_phase = ''`).Error; err != nil {
+		return fmt.Errorf("failed to backfill task execution phases: %w", err)
+	}
+	for _, statement := range []string{
+		"ALTER TABLE tasks ALTER COLUMN version SET DEFAULT 0",
+		"ALTER TABLE tasks ALTER COLUMN version SET NOT NULL",
+		"ALTER TABLE tasks ALTER COLUMN last_cvm_event_version SET DEFAULT 0",
+		"ALTER TABLE tasks ALTER COLUMN last_cvm_event_version SET NOT NULL",
+		"ALTER TABLE tasks ALTER COLUMN execution_phase SET DEFAULT ''",
+		"ALTER TABLE tasks ALTER COLUMN execution_phase SET NOT NULL",
+		"ALTER TABLE tasks ALTER COLUMN execution_reason_code SET DEFAULT ''",
+		"ALTER TABLE tasks ALTER COLUMN execution_reason_code SET NOT NULL",
+		"ALTER TABLE tasks ALTER COLUMN bootstrap_phase SET DEFAULT ''",
+		"ALTER TABLE tasks ALTER COLUMN bootstrap_phase SET NOT NULL",
+		"ALTER TABLE tasks ALTER COLUMN diagnostic_summary SET DEFAULT ''",
+		"ALTER TABLE tasks ALTER COLUMN diagnostic_summary SET NOT NULL",
+	} {
+		if err := DB.Exec(statement).Error; err != nil {
+			return fmt.Errorf("failed to constrain task execution columns: %w", err)
+		}
+	}
+	return nil
+}
+
+func migrateSampleOrganizationIndexes() error {
+	statements := []string{
+		"UPDATE samples SET manual_matched_pair = matched_pair WHERE matched_pair IS NOT NULL AND matched_pair::text NOT IN ('', 'null', '{}') AND (manual_matched_pair IS NULL OR manual_matched_pair::text IN ('', 'null', '{}')) AND (auto_matched_pair IS NULL OR auto_matched_pair::text IN ('', 'null', '{}')) AND match_mode IS DISTINCT FROM 'automatic'",
+		"UPDATE samples SET auto_matched_pair = matched_pair WHERE matched_pair IS NOT NULL AND matched_pair::text NOT IN ('', 'null', '{}') AND (manual_matched_pair IS NULL OR manual_matched_pair::text IN ('', 'null', '{}')) AND (auto_matched_pair IS NULL OR auto_matched_pair::text IN ('', 'null', '{}')) AND match_mode = 'automatic'",
+		"UPDATE samples SET match_status = 'matched', match_mode = 'manual' WHERE manual_matched_pair IS NOT NULL AND manual_matched_pair::text NOT IN ('', 'null', '{}')",
+		"UPDATE samples SET match_status = 'matched', match_mode = 'automatic' WHERE (manual_matched_pair IS NULL OR manual_matched_pair::text IN ('', 'null', '{}')) AND auto_matched_pair IS NOT NULL AND auto_matched_pair::text NOT IN ('', 'null', '{}')",
+		"UPDATE samples SET manual_matched_pair = 'null'::jsonb WHERE manual_matched_pair IS NULL",
+		"UPDATE samples SET auto_matched_pair = 'null'::jsonb WHERE auto_matched_pair IS NULL",
+		"UPDATE samples SET match_mode = '' WHERE match_mode IS NULL",
+		"DROP INDEX IF EXISTS idx_sample_data_links_sample_id",
+		"CREATE UNIQUE INDEX IF NOT EXISTS idx_sample_data_link_mode ON sample_data_links (sample_id, match_mode)",
+		"DROP INDEX IF EXISTS idx_samples_internal_id",
+		"DROP INDEX IF EXISTS uni_samples_internal_id",
+		"CREATE UNIQUE INDEX IF NOT EXISTS idx_samples_org_internal_id ON samples (external_org_id, internal_id) WHERE external_org_id <> ''",
+		"CREATE UNIQUE INDEX IF NOT EXISTS idx_samples_user_internal_id ON samples (created_by, internal_id) WHERE external_org_id = ''",
+	}
+	for _, statement := range statements {
+		if err := DB.Exec(statement).Error; err != nil {
+			return fmt.Errorf("failed to migrate sample organization indexes: %w", err)
+		}
+	}
+	return nil
+}
+
+// GetDB returns the database instance
+func GetDB() *gorm.DB {
+	return DB
+}
+
+// Ping checks that the database is reachable.
+func Ping(ctx context.Context) error {
+	if DB == nil {
+		return fmt.Errorf("database not initialized")
+	}
+	sqlDB, err := DB.DB()
+	if err != nil {
+		return err
+	}
+	return sqlDB.PingContext(ctx)
+}
+
+// CloseDB closes database connection
+func CloseDB() error {
+	if DB == nil {
+		return nil
+	}
+
+	sqlDB, err := DB.DB()
+	if err != nil {
+		return err
+	}
+	return sqlDB.Close()
+}
+
+// Upgrade configurations only; generation records retain their original metadata.
+func migrateReportProtocol() error {
+	if err := DB.Model(&model.ReportTemplate{}).
+		Where("contract_version IS NULL OR contract_version <> ?", model.ReportContractV2).
+		Updates(map[string]interface{}{"contract_version": model.ReportContractV2, "revision": gorm.Expr("revision + 1")}).Error; err != nil {
+		return fmt.Errorf("migrate report service protocol: %w", err)
+	}
+	return nil
+}

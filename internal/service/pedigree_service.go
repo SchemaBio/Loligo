@@ -1,0 +1,466 @@
+package service
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/SchemaBio/Loligo/internal/config"
+	"github.com/SchemaBio/Loligo/internal/database"
+	"github.com/SchemaBio/Loligo/internal/model"
+	"github.com/SchemaBio/Loligo/internal/repository"
+	"github.com/google/uuid"
+)
+
+// PedigreeService handles pedigree business logic
+type PedigreeService struct {
+	cfg        *config.Config
+	repo       *repository.PedigreeRepository
+	memberRepo *repository.PedigreeMemberRepository
+	sampleRepo *repository.SampleRepository
+}
+
+// NewPedigreeService creates a new pedigree service
+func NewPedigreeService(cfg *config.Config) *PedigreeService {
+	return &PedigreeService{
+		cfg:        cfg,
+		repo:       repository.NewPedigreeRepository(),
+		memberRepo: repository.NewPedigreeMemberRepository(),
+		sampleRepo: repository.NewSampleRepository(),
+	}
+}
+
+// List returns paginated pedigrees
+func (s *PedigreeService) List(query *model.PedigreeListQuery) (*model.PedigreeListResponse, error) {
+	pedigrees, total, err := s.repo.PaginateByQuery(query)
+	if err != nil {
+		return nil, err
+	}
+
+	items := make([]model.PedigreeResponse, len(pedigrees))
+	for i, p := range pedigrees {
+		items[i] = model.PedigreeResponse{
+			ID:          p.ID,
+			Name:        p.Name,
+			Disease:     p.Disease,
+			MemberCount: s.repo.CountMembers(p.ID),
+			CreatedAt:   p.CreatedAt.Format(time.RFC3339),
+			UpdatedAt:   p.UpdatedAt.Format(time.RFC3339),
+		}
+	}
+
+	return &model.PedigreeListResponse{
+		Total: total,
+		Items: items,
+	}, nil
+}
+
+// Get returns a pedigree with all members
+func (s *PedigreeService) Get(id string) (*model.PedigreeDetailResponse, error) {
+	pedigree, members, err := s.repo.FindByIDWithMembers(id)
+	if err != nil {
+		return nil, err
+	}
+
+	memberResps := make([]model.PedigreeMemberResp, len(members))
+	for i, m := range members {
+		memberResps[i] = s.memberResponse(&m)
+	}
+
+	return &model.PedigreeDetailResponse{
+		ID:              pedigree.ID,
+		Name:            pedigree.Name,
+		Disease:         pedigree.Disease,
+		Note:            pedigree.Note,
+		ProbandMemberID: pedigree.ProbandMemberID,
+		Members:         memberResps,
+		CreatedAt:       pedigree.CreatedAt.Format(time.RFC3339),
+		UpdatedAt:       pedigree.UpdatedAt.Format(time.RFC3339),
+	}, nil
+}
+
+func (s *PedigreeService) GetModel(id string) (*model.Pedigree, error) {
+	pedigree, err := s.repo.FindByStringID(id)
+	if err != nil {
+		return nil, errors.New("pedigree not found")
+	}
+	return pedigree, nil
+}
+
+// Create creates a new pedigree
+func (s *PedigreeService) Create(req *model.PedigreeCreateRequest, userID uint, orgs ...string) (*model.Pedigree, error) {
+	orgID := ""
+	if len(orgs) > 0 {
+		orgID = orgs[0]
+	}
+	pedigree := &model.Pedigree{
+		ExternalOrgID: orgID,
+		ID:            uuid.New().String(),
+		Name:          req.Name,
+		Disease:       req.Disease,
+		Note:          req.Note,
+		CreatedBy:     userID,
+	}
+
+	if err := s.repo.Create(pedigree); err != nil {
+		return nil, err
+	}
+
+	return pedigree, nil
+}
+
+// Update updates a pedigree
+func (s *PedigreeService) Update(id string, req *model.PedigreeUpdateRequest) (*model.Pedigree, error) {
+	pedigree, err := s.repo.FindByStringID(id)
+	if err != nil {
+		return nil, errors.New("pedigree not found")
+	}
+
+	if req.Name != "" {
+		pedigree.Name = req.Name
+	}
+	if req.Disease != "" {
+		pedigree.Disease = req.Disease
+	}
+	if req.Note != "" {
+		pedigree.Note = req.Note
+	}
+
+	if err := s.repo.Update(pedigree); err != nil {
+		return nil, err
+	}
+
+	return pedigree, nil
+}
+
+// Delete deletes a pedigree and all its members
+func (s *PedigreeService) Delete(id string) error {
+	// Delete members first
+	if err := s.memberRepo.DeleteByPedigreeID(id); err != nil {
+		return err
+	}
+	return s.repo.DeleteByID(id)
+}
+
+// SetProband sets a member as the proband
+func (s *PedigreeService) SetProband(pedigreeID, memberID string) (*model.PedigreeDetailResponse, error) {
+	// Verify pedigree exists
+	_, err := s.repo.FindByStringID(pedigreeID)
+	if err != nil {
+		return nil, errors.New("pedigree not found")
+	}
+
+	// Verify member exists
+	member, err := s.memberRepo.FindByStringID(memberID)
+	if err != nil || member.PedigreeID != pedigreeID {
+		return nil, errors.New("member not found")
+	}
+
+	// Update proband in transaction
+	tx := database.GetDB().Begin()
+	if tx.Error != nil {
+		return nil, tx.Error
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			tx.Rollback()
+		}
+	}()
+	if err := s.memberRepo.UpdateProband(pedigreeID, memberID, tx); err != nil {
+		return nil, err
+	}
+
+	// Update pedigree's proband_member_id
+	if err := tx.Model(&model.Pedigree{}).Where("id = ?", pedigreeID).
+		Update("proband_member_id", memberID).Error; err != nil {
+		return nil, err
+	}
+
+	if err := tx.Commit().Error; err != nil {
+		return nil, err
+	}
+	committed = true
+
+	return s.Get(pedigreeID)
+}
+
+// --- Member operations ---
+
+// ListMembers returns all members of a pedigree
+func (s *PedigreeService) ListMembers(pedigreeID string) ([]model.PedigreeMemberResp, error) {
+	members, err := s.memberRepo.FindByPedigreeID(pedigreeID)
+	if err != nil {
+		return nil, err
+	}
+
+	result := make([]model.PedigreeMemberResp, len(members))
+	for i, m := range members {
+		result[i] = s.memberResponse(&m)
+	}
+
+	return result, nil
+}
+
+// GetMember returns a single member
+func (s *PedigreeService) GetMember(pedigreeID, memberID string) (*model.PedigreeMemberResp, error) {
+	member, err := s.memberRepo.FindByStringID(memberID)
+	if err != nil {
+		return nil, errors.New("member not found")
+	}
+	if member.PedigreeID != pedigreeID {
+		return nil, errors.New("member does not belong to this pedigree")
+	}
+
+	resp := s.memberResponse(member)
+	return &resp, nil
+}
+
+// CreateMember creates a new member in a pedigree
+func (s *PedigreeService) CreateMember(pedigreeID string, req *model.PedigreeMemberCreateRequest, actor model.OverlayActor) (*model.PedigreeMemberResp, error) {
+	// Verify pedigree exists
+	_, err := s.repo.FindByStringID(pedigreeID)
+	if err != nil {
+		return nil, errors.New("pedigree not found")
+	}
+	if err := s.validateLinkedSample(req.SampleID, actor); err != nil {
+		return nil, err
+	}
+	if err := s.validateParentMembers(pedigreeID, "", req.FatherID, req.MotherID); err != nil {
+		return nil, err
+	}
+
+	hasSample := req.SampleID != ""
+	member := &model.PedigreeMember{
+		ID:             uuid.New().String(),
+		PedigreeID:     pedigreeID,
+		SampleID:       req.SampleID,
+		Name:           req.Name,
+		Gender:         req.Gender,
+		BirthYear:      req.BirthYear,
+		IsDeceased:     req.IsDeceased,
+		DeceasedYear:   req.DeceasedYear,
+		Relation:       req.Relation,
+		AffectedStatus: req.AffectedStatus,
+		Phenotypes:     req.Phenotypes,
+		FatherID:       req.FatherID,
+		MotherID:       req.MotherID,
+		Generation:     req.Generation,
+		Position:       req.Position,
+		HasSample:      hasSample,
+	}
+	for _, field := range req.SourceSampleFields {
+		if !hasSample || (field != "name" && field != "gender" && field != "phenotypes" && field != "birth_year") {
+			return nil, fmt.Errorf("invalid sample-derived field")
+		}
+	}
+	sourceFields, _ := json.Marshal(req.SourceSampleFields)
+	if len(req.SourceSampleFields) == 0 {
+		sourceFields = []byte("[]")
+	}
+	member.SourceSampleFields = string(sourceFields)
+
+	if member.Gender == "" {
+		member.Gender = model.GenderUnknown
+	}
+	if member.AffectedStatus == "" {
+		member.AffectedStatus = model.AffectedStatusUnknown
+	}
+
+	if err := s.memberRepo.Create(member); err != nil {
+		return nil, err
+	}
+
+	resp := s.memberResponse(member)
+	return &resp, nil
+}
+
+// UpdateMember updates a member
+func (s *PedigreeService) UpdateMember(pedigreeID, memberID string, req *model.PedigreeMemberUpdateRequest, actor model.OverlayActor) (*model.PedigreeMemberResp, error) {
+	member, err := s.memberRepo.FindByStringID(memberID)
+	if err != nil {
+		return nil, errors.New("member not found")
+	}
+	if member.PedigreeID != pedigreeID {
+		return nil, errors.New("member does not belong to this pedigree")
+	}
+	// Explicit changes become independent member content; unchanged copies keep
+	// their provenance and remain subject to the source sample's deadline.
+	var copied []string
+	_ = json.Unmarshal([]byte(member.SourceSampleFields), &copied)
+	retained := []string{}
+	for _, field := range copied {
+		changed := field == "name" && req.Name != "" && req.Name != member.Name || field == "gender" && req.Gender != "" && req.Gender != member.Gender || field == "birth_year" && req.BirthYear != nil && (member.BirthYear == nil || *req.BirthYear != *member.BirthYear)
+		if field == "phenotypes" && req.Phenotypes != nil {
+			a, _ := json.Marshal(req.Phenotypes)
+			b, _ := json.Marshal(member.Phenotypes)
+			changed = string(a) != string(b)
+		}
+		if !changed {
+			retained = append(retained, field)
+		}
+	}
+	encoded, _ := json.Marshal(retained)
+	member.SourceSampleFields = string(encoded)
+	if err := s.validateLinkedSample(req.SampleID, actor); err != nil {
+		return nil, err
+	}
+	effectiveFatherID := member.FatherID
+	if req.FatherID != "" {
+		effectiveFatherID = req.FatherID
+	}
+	effectiveMotherID := member.MotherID
+	if req.MotherID != "" {
+		effectiveMotherID = req.MotherID
+	}
+	if err := s.validateParentMembers(pedigreeID, memberID, effectiveFatherID, effectiveMotherID); err != nil {
+		return nil, err
+	}
+
+	if req.Name != "" {
+		member.Name = req.Name
+	}
+	if req.Gender != "" {
+		member.Gender = req.Gender
+	}
+	if req.BirthYear != nil {
+		member.BirthYear = req.BirthYear
+	}
+	if req.IsDeceased != nil {
+		member.IsDeceased = *req.IsDeceased
+	}
+	if req.DeceasedYear != nil {
+		member.DeceasedYear = req.DeceasedYear
+	}
+	if req.Relation != "" {
+		member.Relation = req.Relation
+	}
+	if req.AffectedStatus != "" {
+		member.AffectedStatus = req.AffectedStatus
+	}
+	if req.Phenotypes != nil {
+		member.Phenotypes = req.Phenotypes
+	}
+	if req.FatherID != "" {
+		member.FatherID = req.FatherID
+	}
+	if req.MotherID != "" {
+		member.MotherID = req.MotherID
+	}
+	if req.Generation != nil {
+		member.Generation = *req.Generation
+	}
+	if req.Position != nil {
+		member.Position = *req.Position
+	}
+	if req.SampleID != "" {
+		member.SampleID = req.SampleID
+		member.HasSample = true
+	}
+
+	if err := s.memberRepo.Update(member); err != nil {
+		return nil, err
+	}
+
+	resp := s.memberResponse(member)
+	return &resp, nil
+}
+
+func (s *PedigreeService) validateLinkedSample(sampleID string, actor model.OverlayActor) error {
+	sampleID = strings.TrimSpace(sampleID)
+	if sampleID == "" {
+		return nil
+	}
+	if _, err := s.sampleRepo.FindScopedByUUID(sampleID, actor); err != nil {
+		return errors.New("sample not found")
+	}
+	return nil
+}
+
+func (s *PedigreeService) validateParentMembers(pedigreeID, memberID, fatherID, motherID string) error {
+	fatherID = strings.TrimSpace(fatherID)
+	motherID = strings.TrimSpace(motherID)
+	if fatherID != "" && fatherID == motherID {
+		return errors.New("father and mother must be different members")
+	}
+	for label, id := range map[string]string{"father": fatherID, "mother": motherID} {
+		if id == "" {
+			continue
+		}
+		if memberID != "" && id == memberID {
+			return fmt.Errorf("%s cannot reference the member itself", label)
+		}
+		parent, err := s.memberRepo.FindByStringID(id)
+		if err != nil || parent.PedigreeID != pedigreeID {
+			return fmt.Errorf("%s member not found in this pedigree", label)
+		}
+	}
+	return nil
+}
+
+// DeleteMember deletes a member
+func (s *PedigreeService) DeleteMember(pedigreeID, memberID string) error {
+	member, err := s.memberRepo.FindByStringID(memberID)
+	if err != nil {
+		return errors.New("member not found")
+	}
+	if member.PedigreeID != pedigreeID {
+		return errors.New("member does not belong to this pedigree")
+	}
+	return s.memberRepo.DeleteByID(memberID)
+}
+
+// MemberToResponse converts a PedigreeMember to PedigreeMemberResp
+func MemberToResponse(m *model.PedigreeMember) model.PedigreeMemberResp {
+	return model.PedigreeMemberResp{
+		ID:             m.ID,
+		PedigreeID:     m.PedigreeID,
+		SampleID:       m.SampleID,
+		Name:           m.Name,
+		Gender:         m.Gender,
+		BirthYear:      m.BirthYear,
+		IsDeceased:     m.IsDeceased,
+		DeceasedYear:   m.DeceasedYear,
+		Relation:       m.Relation,
+		AffectedStatus: m.AffectedStatus,
+		Phenotypes:     m.Phenotypes,
+		FatherID:       m.FatherID,
+		MotherID:       m.MotherID,
+		Generation:     m.Generation,
+		Position:       m.Position,
+		HasSample:      m.HasSample,
+		CreatedAt:      m.CreatedAt.Format(time.RFC3339),
+		UpdatedAt:      m.UpdatedAt.Format(time.RFC3339),
+	}
+}
+
+func (s *PedigreeService) memberResponse(member *model.PedigreeMember) model.PedigreeMemberResp {
+	if s.cfg.IsSaaS() && member.SampleID != "" {
+		sample, err := s.sampleRepo.FindByUUID(member.SampleID)
+		if err != nil {
+			copy := *member
+			updates := expiredSampleMemberUpdates(member)
+			copy.SampleID = ""
+			copy.HasSample = false
+			if _, ok := updates["name"]; ok {
+				copy.Name = "—"
+			}
+			if _, ok := updates["gender"]; ok {
+				copy.Gender = model.GenderUnknown
+			}
+			if _, ok := updates["birth_year"]; ok {
+				copy.BirthYear = nil
+			}
+			if _, ok := updates["phenotypes"]; ok {
+				copy.Phenotypes = nil
+			}
+			return MemberToResponse(&copy)
+		}
+		response := MemberToResponse(member)
+		response.SampleExpiresAt = sample.ExpiresAt
+		return response
+	}
+	return MemberToResponse(member)
+}

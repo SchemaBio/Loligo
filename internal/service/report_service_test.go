@@ -1,0 +1,228 @@
+package service
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"strings"
+	"testing"
+
+	"github.com/SchemaBio/Loligo/internal/model"
+)
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func TestReportEndpointConfigurationDoesNotRequireDNS(t *testing.T) {
+	for _, endpoint := range []string{"https://test.test.test/generate", "https://not-deployed.invalid/report"} {
+		if err := validateReportAPIEndpoint(endpoint); err != nil {
+			t.Fatalf("endpoint must be configurable before DNS is available: %v", err)
+		}
+	}
+}
+
+func TestGenerateReportDownloadReturnsConnectionFailureAtCallTime(t *testing.T) {
+	called := false
+	svc := &ReportService{http: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		called = true
+		return nil, fmt.Errorf("report service is not online")
+	})}}
+	_, err := svc.generateReportDownload(context.Background(),
+		&model.ReportTemplate{Name: "preconfigured", APIEndpoint: "https://not-deployed.invalid/report", APIKey: "test-key", ContractVersion: model.ReportContractV2},
+		&model.Task{UUID: "task-1"}, &model.ReportCreateRequest{Name: "report", SnapshotJSON: `{}`}, "user")
+	if !called || err == nil || !strings.Contains(err.Error(), "report API request failed") {
+		t.Fatalf("expected error from actual report request, called=%v err=%v", called, err)
+	}
+}
+
+func TestValidateReportAPIEndpointRejectsPrivateIP(t *testing.T) {
+	err := validateReportAPIEndpointWithResolver("https://reports.example.com/generate", func(string) ([]net.IP, error) {
+		return []net.IP{net.ParseIP("10.0.0.10")}, nil
+	})
+	if err == nil {
+		t.Fatal("expected private IP endpoint to be rejected")
+	}
+}
+
+func TestValidateReportAPIEndpointRejectsUserInfo(t *testing.T) {
+	err := validateReportAPIEndpointWithResolver("https://user:pass@reports.example.com/generate", func(string) ([]net.IP, error) {
+		return []net.IP{net.ParseIP("8.8.8.8")}, nil
+	})
+	if err == nil {
+		t.Fatal("expected endpoint with user info to be rejected")
+	}
+}
+
+func TestValidateReportAPIEndpointRejectsHTTP(t *testing.T) {
+	err := validateReportAPIEndpointWithResolver("http://reports.example.com/generate", func(string) ([]net.IP, error) {
+		return []net.IP{net.ParseIP("8.8.8.8")}, nil
+	})
+	if err == nil {
+		t.Fatal("expected non-HTTPS endpoint to be rejected")
+	}
+}
+
+func TestValidateReportAPIEndpointAcceptsPublicHTTPS(t *testing.T) {
+	err := validateReportAPIEndpointWithResolver("https://reports.example.com/generate", func(string) ([]net.IP, error) {
+		return []net.IP{net.ParseIP("8.8.8.8")}, nil
+	})
+	if err != nil {
+		t.Fatalf("expected public HTTPS endpoint to be accepted: %v", err)
+	}
+}
+
+func TestValidateReportAPIEndpointResolverError(t *testing.T) {
+	err := validateReportAPIEndpointWithResolver("https://reports.example.com/generate", func(string) ([]net.IP, error) {
+		return nil, fmt.Errorf("resolver unavailable")
+	})
+	if err == nil {
+		t.Fatal("expected resolver error to reject endpoint")
+	}
+}
+
+func TestGenerateReportDownloadStreamsAPIResponse(t *testing.T) {
+	var gotAuthorization string
+	var gotContentType string
+	var gotAccept string
+	var gotBody string
+	svc := &ReportService{
+		http: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			gotAuthorization = req.Header.Get("Authorization")
+			gotContentType = req.Header.Get("Content-Type")
+			gotAccept = req.Header.Get("Accept")
+			body, _ := io.ReadAll(req.Body)
+			gotBody = string(body)
+			return &http.Response{
+				StatusCode:    http.StatusOK,
+				Header:        http.Header{"Content-Type": []string{"application/pdf"}, "Content-Disposition": []string{`attachment; filename="case-report.pdf"`}},
+				Body:          io.NopCloser(strings.NewReader("report-bytes")),
+				ContentLength: int64(len("report-bytes")),
+				Request:       req,
+			}, nil
+		})},
+	}
+
+	download, err := svc.generateReportDownload(
+		context.Background(),
+		&model.ReportTemplate{Name: "clinical", APIEndpoint: "https://8.8.8.8/generate", APIKey: "secret", ContractVersion: model.ReportContractV2},
+		&model.Task{UUID: "task-1", Name: "Task One", SampleID: "sample-1", Pipeline: "wes"},
+		&model.ReportCreateRequest{Name: "ignored-name", TemplateName: "clinical", SnapshotJSON: `{}`},
+		"user@example.com",
+	)
+	if err != nil {
+		t.Fatalf("generateReportDownload returned error: %v", err)
+	}
+	defer download.Body.Close()
+
+	if gotAuthorization != "Bearer secret" {
+		t.Fatalf("unexpected authorization header: %q", gotAuthorization)
+	}
+	if gotContentType != "application/json" {
+		t.Fatalf("unexpected content type header: %q", gotContentType)
+	}
+	if !strings.Contains(gotAccept, "application/pdf") {
+		t.Fatalf("expected Accept to include application/pdf, got %q", gotAccept)
+	}
+	if !strings.Contains(gotBody, `"task_result_uuid":"task-1"`) || !strings.Contains(gotBody, `"created_by":"user@example.com"`) {
+		t.Fatalf("unexpected report API payload: %s", gotBody)
+	}
+	if download.FileName != "case-report.pdf" {
+		t.Fatalf("unexpected filename: %q", download.FileName)
+	}
+	if download.ContentType != "application/pdf" {
+		t.Fatalf("unexpected download content type: %q", download.ContentType)
+	}
+	data, _ := io.ReadAll(download.Body)
+	if string(data) != "report-bytes" {
+		t.Fatalf("unexpected download body: %q", string(data))
+	}
+}
+
+func TestValidateTemplateEndpointRequiresAndVerifiesBearerKey(t *testing.T) {
+	var gotAuthorization string
+	svc := &ReportService{
+		http: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			gotAuthorization = req.Header.Get("Authorization")
+			return &http.Response{
+				StatusCode: http.StatusUnauthorized,
+				Body:       io.NopCloser(strings.NewReader("unauthorized")),
+				Request:    req,
+			}, nil
+		})},
+	}
+
+	_, err := svc.ValidateTemplateEndpoint(context.Background(), "https://8.8.8.8/generate", "secret")
+	if err == nil || !strings.Contains(err.Error(), "authentication key") {
+		t.Fatalf("expected authentication rejection, got %v", err)
+	}
+	if gotAuthorization != "Bearer secret" {
+		t.Fatalf("unexpected authorization header: %q", gotAuthorization)
+	}
+
+	_, err = svc.ValidateTemplateEndpoint(context.Background(), "https://8.8.8.8/generate", "")
+	if err == nil || !strings.Contains(err.Error(), "API key is required") {
+		t.Fatalf("expected missing key validation error, got %v", err)
+	}
+}
+
+func TestReportDownloadFileNameFallbackAndSanitize(t *testing.T) {
+	got := reportDownloadFileName("../unsafe/name", "template", "task-1", "", "application/pdf")
+	if got != "name.pdf" {
+		t.Fatalf("unexpected sanitized filename: %q", got)
+	}
+
+	got = reportDownloadFileName("", "template", "task-1", "", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+	if got != "template.xlsx" {
+		t.Fatalf("unexpected fallback filename: %q", got)
+	}
+}
+
+func TestGenerateReportDownloadReturnsAPIError(t *testing.T) {
+	svc := &ReportService{
+		http: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusBadGateway,
+				Body:       io.NopCloser(strings.NewReader("upstream failed")),
+				Request:    req,
+			}, nil
+		})},
+	}
+
+	_, err := svc.generateReportDownload(
+		context.Background(),
+		&model.ReportTemplate{Name: "clinical", APIEndpoint: "https://8.8.8.8/generate", APIKey: "secret", ContractVersion: model.ReportContractV2},
+		&model.Task{UUID: "task-1"},
+		&model.ReportCreateRequest{Name: "report", TemplateName: "clinical", SnapshotJSON: `{}`},
+		"user@example.com",
+	)
+	if err == nil || !strings.Contains(err.Error(), "report API returned 502") {
+		t.Fatalf("expected upstream error, got %v", err)
+	}
+}
+
+func TestReportDownloadBodyRejectsChunkedOversize(t *testing.T) {
+	body := newMaxBytesReadCloser(io.NopCloser(io.LimitReader(infiniteByteReader{}, maxReportDownloadBytes+1)), maxReportDownloadBytes)
+	defer body.Close()
+
+	_, err := io.Copy(io.Discard, body)
+	if err == nil {
+		t.Fatal("expected oversized chunked response body to fail")
+	}
+	if !strings.Contains(err.Error(), ErrReportDownloadTooLarge.Error()) {
+		t.Fatalf("expected size error, got %v", err)
+	}
+}
+
+type infiniteByteReader struct{}
+
+func (infiniteByteReader) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = 'a'
+	}
+	return len(p), nil
+}

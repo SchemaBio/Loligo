@@ -1,0 +1,308 @@
+package model
+
+import (
+	"time"
+)
+
+type UploadFileType string
+
+const (
+	UploadFileTypeVCF         UploadFileType = "vcf"
+	UploadFileTypeFastqPaired UploadFileType = "fastq_paired"
+	UploadFileTypeFastqSingle UploadFileType = "fastq_single"
+	UploadFileTypeBed         UploadFileType = "bed"
+	UploadFileTypeOther       UploadFileType = "other"
+)
+
+type UploadProvider string
+
+const (
+	UploadProviderLocal UploadProvider = "local"
+	UploadProviderS3    UploadProvider = "s3"
+)
+
+type UploadJobStatus string
+
+const (
+	UploadJobStatusPending   UploadJobStatus = "pending"
+	UploadJobStatusUploading UploadJobStatus = "uploading"
+	UploadJobStatusCompleted UploadJobStatus = "completed"
+	UploadJobStatusFailed    UploadJobStatus = "failed"
+	UploadJobStatusDeleting  UploadJobStatus = "deleting"
+	UploadJobStatusDeleted   UploadJobStatus = "deleted"
+)
+
+const (
+	DataUploadPolicyVersion = "saas-data-retention-v2"
+	BEDUploadPolicyVersion  = "saas-bed-storage-v1"
+	SaaSMaxUploadFileBytes  = int64(20) * 1024 * 1024 * 1024
+)
+
+type ReadType string
+
+const (
+	ReadTypeVCF    ReadType = "vcf"
+	ReadTypeRead1  ReadType = "read1"
+	ReadTypeRead2  ReadType = "read2"
+	ReadTypeSingle ReadType = "single"
+	ReadTypeBed    ReadType = "bed"
+)
+
+type FileStatus string
+
+const (
+	FileStatusPending   FileStatus = "pending"
+	FileStatusUploading FileStatus = "uploading"
+	FileStatusCompleted FileStatus = "completed"
+	FileStatusFailed    FileStatus = "failed"
+	FileStatusMissing   FileStatus = "missing"
+	FileStatusDeleting  FileStatus = "deleting"
+	FileStatusDeleted   FileStatus = "deleted"
+)
+
+type UploadJob struct {
+	ID                         uint            `json:"-" gorm:"primaryKey"`
+	UUID                       string          `json:"id" gorm:"uniqueIndex;size:36;not null"`
+	UserID                     uint            `json:"user_id" gorm:"index;not null"`
+	ExternalOrgID              string          `json:"-" gorm:"size:100;index"` // optional external tenant reference (mirrors Task.ExternalOrgID)
+	SampleID                   string          `json:"sample_id" gorm:"size:36;index"`
+	InternalID                 string          `json:"internal_id,omitempty" gorm:"size:100;index"`
+	Name                       string          `json:"name" gorm:"size:255;not null"`
+	FileType                   UploadFileType  `json:"file_type" gorm:"size:50;not null"`
+	ReferenceGenome            string          `json:"reference_genome,omitempty" gorm:"size:20;index"`
+	Provider                   UploadProvider  `json:"provider" gorm:"size:20;not null;default:local"`
+	Status                     UploadJobStatus `json:"status" gorm:"size:20;not null;default:pending"`
+	UploadPolicyVersion        string          `json:"upload_policy_version,omitempty" gorm:"size:64"`
+	UploadPolicyAcknowledgedAt *time.Time      `json:"upload_policy_acknowledged_at,omitempty" gorm:"type:timestamptz"`
+	CreatedAt                  time.Time       `json:"created_at" gorm:"type:timestamptz"`
+	UpdatedAt                  time.Time       `json:"updated_at" gorm:"type:timestamptz"`
+}
+
+type UploadFile struct {
+	ID         uint       `json:"-" gorm:"primaryKey"`
+	UUID       string     `json:"id" gorm:"uniqueIndex;size:36;not null"`
+	JobID      uint       `json:"-" gorm:"index;not null"`
+	JobUUID    string     `json:"job_id" gorm:"size:36;index"`
+	FileName   string     `json:"file_name" gorm:"size:500;not null"`
+	StorageKey string     `json:"storage_key" gorm:"size:1000;not null"`
+	FileSize   int64      `json:"file_size" gorm:"default:0"`
+	ReadType   ReadType   `json:"read_type" gorm:"size:20;not null"`
+	Status     FileStatus `json:"status" gorm:"size:20;not null;default:pending"`
+	CreatedAt  time.Time  `json:"created_at" gorm:"type:timestamptz"`
+	UpdatedAt  time.Time  `json:"updated_at" gorm:"type:timestamptz"`
+}
+
+type UploadJobCreateRequest struct {
+	SampleID                 string                 `json:"sample_id"`
+	InternalID               string                 `json:"internal_id" binding:"omitempty,max=100"`
+	Name                     string                 `json:"name" binding:"required"`
+	FileType                 UploadFileType         `json:"file_type" binding:"required"`
+	ReferenceGenome          string                 `json:"reference_genome"`
+	Provider                 UploadProvider         `json:"provider"`
+	UploadPolicyAcknowledged bool                   `json:"upload_policy_acknowledged"`
+	Files                    []UploadFileCreateItem `json:"files" binding:"required,min=1,dive"`
+	StorageQuotaBytes        int64                  `json:"-"`
+}
+
+type UploadFileCreateItem struct {
+	FileName string   `json:"file_name" binding:"required"`
+	ReadType ReadType `json:"read_type" binding:"required"`
+	FileSize int64    `json:"file_size"`
+}
+
+type UploadJobResponse struct {
+	ID                         string               `json:"id"`
+	UserID                     uint                 `json:"user_id"`
+	SampleID                   string               `json:"sample_id,omitempty"`
+	InternalID                 string               `json:"internal_id,omitempty"`
+	Name                       string               `json:"name"`
+	FileType                   UploadFileType       `json:"file_type"`
+	ReferenceGenome            string               `json:"reference_genome,omitempty"`
+	Provider                   UploadProvider       `json:"provider"`
+	Status                     UploadJobStatus      `json:"status"`
+	UploadPolicyVersion        string               `json:"upload_policy_version,omitempty"`
+	UploadPolicyAcknowledgedAt *time.Time           `json:"upload_policy_acknowledged_at,omitempty"`
+	Files                      []UploadFileResponse `json:"files,omitempty"`
+	CreatedAt                  string               `json:"created_at"`
+	UpdatedAt                  string               `json:"updated_at"`
+}
+
+type UploadFileResponse struct {
+	ID           string     `json:"id"`
+	JobID        string     `json:"job_id"`
+	FileName     string     `json:"file_name"`
+	StorageKey   string     `json:"-"` // server-local path/storage key must never be serialized to browsers
+	FileSize     int64      `json:"file_size"`
+	ReadType     ReadType   `json:"read_type"`
+	Status       FileStatus `json:"status"`
+	PresignedURL string     `json:"presigned_url,omitempty"`
+	CreatedAt    string     `json:"created_at"`
+}
+
+type UploadJobListQuery struct {
+	Page     int             `form:"page" binding:"omitempty,min=1"`
+	PageSize int             `form:"page_size" binding:"omitempty,min=1,max=100"`
+	Status   UploadJobStatus `form:"status"`
+	FileType UploadFileType  `form:"file_type"`
+}
+
+type UploadJobListResponse struct {
+	Total int64               `json:"total"`
+	Items []UploadJobResponse `json:"items"`
+}
+
+type UploadFileCompleteRequest struct {
+	FileSize int64 `json:"file_size"`
+}
+
+const (
+	MultipartThresholdBytes int64 = 64 * 1024 * 1024
+	MultipartPartSizeBytes  int64 = 32 * 1024 * 1024
+)
+
+// UploadMultipartSession tracks one resumable object-store multipart upload.
+// UploadID and StorageKey are server-only values and are never serialized.
+type UploadMultipartSession struct {
+	ID          uint       `json:"-" gorm:"primaryKey"`
+	UUID        string     `json:"id" gorm:"uniqueIndex;size:36;not null"`
+	FileUUID    string     `json:"file_id" gorm:"size:36;index;not null"`
+	JobUUID     string     `json:"job_id" gorm:"size:36;index;not null"`
+	StorageKey  string     `json:"-" gorm:"size:1000;not null"`
+	UploadID    string     `json:"-" gorm:"size:500;not null"`
+	PartSize    int64      `json:"part_size" gorm:"not null"`
+	FileSize    int64      `json:"file_size" gorm:"not null"`
+	Status      string     `json:"status" gorm:"size:20;not null;default:active;index"`
+	CreatedAt   time.Time  `json:"created_at" gorm:"type:timestamptz"`
+	UpdatedAt   time.Time  `json:"updated_at" gorm:"type:timestamptz"`
+	CompletedAt *time.Time `json:"completed_at,omitempty" gorm:"type:timestamptz"`
+}
+
+func (UploadMultipartSession) TableName() string { return "upload_multipart_sessions" }
+
+type UploadMultipartPart struct {
+	ID          uint      `json:"-" gorm:"primaryKey"`
+	SessionUUID string    `json:"session_id" gorm:"size:36;uniqueIndex:upload_multipart_part;not null"`
+	PartNumber  int       `json:"part_number" gorm:"uniqueIndex:upload_multipart_part;not null"`
+	ETag        string    `json:"etag" gorm:"size:500;not null"`
+	Size        int64     `json:"size" gorm:"not null"`
+	CreatedAt   time.Time `json:"created_at" gorm:"type:timestamptz"`
+	UpdatedAt   time.Time `json:"updated_at" gorm:"type:timestamptz"`
+}
+
+func (UploadMultipartPart) TableName() string { return "upload_multipart_parts" }
+
+type MultipartInitResponse struct {
+	SessionID      string `json:"session_id"`
+	FileID         string `json:"file_id"`
+	PartSize       int64  `json:"part_size"`
+	TotalParts     int    `json:"total_parts"`
+	CompletedParts []int  `json:"completed_parts"`
+}
+
+type MultipartPresignRequest struct {
+	PartNumbers []int `json:"part_numbers" binding:"required,min=1,max=100"`
+}
+
+type MultipartPresignItem struct {
+	PartNumber int    `json:"part_number"`
+	URL        string `json:"url"`
+}
+
+type MultipartPresignResponse struct {
+	SessionID string                 `json:"session_id"`
+	Parts     []MultipartPresignItem `json:"parts"`
+}
+
+type MultipartPartRequest struct {
+	PartNumber int    `json:"part_number" binding:"required,min=1"`
+	ETag       string `json:"etag" binding:"required"`
+	Size       int64  `json:"size" binding:"required,min=1"`
+}
+
+func UploadJobToResponse(job *UploadJob, files []UploadFileResponse) UploadJobResponse {
+	return UploadJobResponse{
+		ID:                         job.UUID,
+		UserID:                     job.UserID,
+		SampleID:                   job.SampleID,
+		InternalID:                 job.InternalID,
+		Name:                       job.Name,
+		FileType:                   job.FileType,
+		ReferenceGenome:            job.ReferenceGenome,
+		Provider:                   job.Provider,
+		Status:                     job.Status,
+		UploadPolicyVersion:        job.UploadPolicyVersion,
+		UploadPolicyAcknowledgedAt: job.UploadPolicyAcknowledgedAt,
+		Files:                      files,
+		CreatedAt:                  job.CreatedAt.Format(time.RFC3339),
+		UpdatedAt:                  job.UpdatedAt.Format(time.RFC3339),
+	}
+}
+
+func UploadFileToResponse(file *UploadFile) UploadFileResponse {
+	return UploadFileResponse{
+		ID:        file.UUID,
+		JobID:     file.JobUUID,
+		FileName:  file.FileName,
+		FileSize:  file.FileSize,
+		ReadType:  file.ReadType,
+		Status:    file.Status,
+		CreatedAt: file.CreatedAt.Format(time.RFC3339),
+	}
+}
+
+// UploadFileListQuery is the query parameters for the file-level audit list
+// endpoint (GET /upload/files). OrgID is an explicit admin cross-org filter;
+// the internal scope fields (UserID/ExternalOrgID/IncludeAll) are set by the
+// handler from the caller identity, mirroring TaskListQuery scoping.
+type UploadFileListQuery struct {
+	Page     int        `form:"page" binding:"omitempty,min=1"`
+	PageSize int        `form:"page_size" binding:"omitempty,min=1,max=100"`
+	Status   FileStatus `form:"status"`
+	Search   string     `form:"search"` // matches file_name ILIKE
+	OrgID    string     `form:"org_id"` // admin cross-org filter
+	// internal scope (set by handler, not bound from query):
+	UserID         uint   `json:"-" form:"-"`
+	ExternalOrgID  string `json:"-" form:"-"`
+	IncludeAll     bool   `json:"-" form:"-"`
+	SharedInstance bool   `json:"-" form:"-"`
+}
+
+// UploadFileAuditResponse mirrors UploadFileResponse but exposes audit fields
+// Rossia needs (storage_path, org_id, updated_at). It is for admin/audit
+// consumers only and never reaches browsers via UploadFileResponse.
+type UploadFileAuditResponse struct {
+	ID                         string     `json:"id"`
+	DataAssetID                string     `json:"data_asset_id,omitempty"`
+	JobID                      string     `json:"job_id"`
+	FileName                   string     `json:"file_name"`
+	StoragePath                string     `json:"storage_path"`
+	FileSize                   int64      `json:"file_size"`
+	ReadType                   ReadType   `json:"read_type"`
+	Status                     FileStatus `json:"status"`
+	OrgID                      string     `json:"org_id,omitempty"`
+	UploadPolicyVersion        string     `json:"upload_policy_version,omitempty"`
+	UploadPolicyAcknowledgedAt *time.Time `json:"upload_policy_acknowledged_at,omitempty"`
+	CreatedAt                  string     `json:"created_at"`
+	UpdatedAt                  string     `json:"updated_at"`
+}
+
+// UploadFileListResponse is the list envelope for the file-level audit endpoint.
+type UploadFileListResponse struct {
+	Total int64                     `json:"total"`
+	Items []UploadFileAuditResponse `json:"items"`
+}
+
+type UploadCapacityStats struct {
+	Total         int64 `json:"total"`
+	TotalBytes    int64 `json:"total_bytes"`
+	ReservedBytes int64 `json:"reserved_bytes"`
+	StalePending  int64 `json:"stale_pending"`
+}
+
+func (UploadJob) TableName() string {
+	return "upload_jobs"
+}
+
+func (UploadFile) TableName() string {
+	return "upload_files"
+}

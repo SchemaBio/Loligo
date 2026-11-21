@@ -1,0 +1,134 @@
+package service
+
+import (
+	"context"
+	"fmt"
+	"path"
+	"strings"
+
+	"github.com/SchemaBio/Loligo/internal/config"
+)
+
+const defaultCVMReferenceBucket = "schemabio-1327430028"
+
+type cvmReferenceObjectStorage interface {
+	stat(context.Context, string) (int64, error)
+}
+
+func cvmReferenceStorageConfig(storage config.StorageConfig) (config.StorageConfig, error) {
+	accessKey := strings.TrimSpace(storage.CVMReferenceAccessKey)
+	secretKey := strings.TrimSpace(storage.CVMReferenceSecretKey)
+	if (accessKey == "") != (secretKey == "") {
+		return storage, fmt.Errorf("reference object storage credentials are incomplete")
+	}
+	if accessKey != "" {
+		storage.S3AccessKey = accessKey
+		storage.S3SecretKey = secretKey
+		storage.S3SessionToken = ""
+	}
+	return storage, nil
+}
+
+func cvmReferenceObjectKeys(genome string, requireDefaultBED bool) ([]string, error) {
+	var fasta string
+	switch strings.ToLower(strings.TrimSpace(genome)) {
+	case "hg19":
+		fasta = "Homo_sapiens.GRCh37.dna.primary_assembly.fa"
+	case "hg38":
+		fasta = "Homo_sapiens.GRCh38.dna.primary_assembly.fa"
+	default:
+		return nil, fmt.Errorf("unsupported CVM reference genome")
+	}
+	base := path.Join("database", genome)
+	keys := []string{path.Join(base, fasta), path.Join(base, fasta+".fai")}
+	if requireDefaultBED {
+		keys = append(keys, path.Join(base, genome+"_default.bed"))
+	}
+	return keys, nil
+}
+
+func validateCVMReferenceObjects(ctx context.Context, storage cvmReferenceObjectStorage, genome string, requireDefaultBED bool) error {
+	keys, err := cvmReferenceObjectKeys(genome, requireDefaultBED)
+	if err != nil {
+		return err
+	}
+	return validateCVMReferenceKeys(ctx, storage, keys)
+}
+
+func cvmBaselineReferenceObjectKeys(genome string, requireDefaultBED bool) ([]string, error) {
+	keys, err := cvmReferenceObjectKeys(genome, requireDefaultBED)
+	if err != nil {
+		return nil, err
+	}
+	for _, suffix := range []string{".l2b", ".mbw"} {
+		keys = append(keys, keys[0]+suffix)
+	}
+	return append(keys, path.Join("database", genome, "schema_bundle", genome+"_reference.cnvkit.cnn")), nil
+}
+
+// Validate shared resources first, then prefer the complete minibwa index pair.
+// Standard BWA is supported only when all five of its indexes are available.
+func validateCVMBaselineReferences(ctx context.Context, storage cvmReferenceObjectStorage, genome string, requireDefaultBED bool) error {
+	keys, err := cvmBaselineReferenceObjectKeys(genome, requireDefaultBED)
+	if err != nil {
+		return err
+	}
+	shared, err := cvmReferenceObjectKeys(genome, requireDefaultBED)
+	if err != nil {
+		return err
+	}
+	shared = append(shared, keys[len(keys)-1])
+	if err := validateCVMReferenceKeys(ctx, storage, shared); err != nil {
+		return err
+	}
+	fasta := shared[0]
+	if err := validateCVMReferenceKeys(ctx, storage, []string{fasta + ".l2b", fasta + ".mbw"}); err == nil {
+		return nil
+	}
+	var bwa []string
+	for _, suffix := range []string{".amb", ".ann", ".bwt", ".pac", ".sa"} {
+		bwa = append(bwa, fasta+suffix)
+	}
+	if err := validateCVMReferenceKeys(ctx, storage, bwa); err != nil {
+		return &CVMInputObjectError{ReasonCode: "REFERENCE_DATABASE_FAILED", err: fmt.Errorf("reference mapping indexes are missing or unreadable: a complete minibwa (.l2b, .mbw) or BWA (.amb, .ann, .bwt, .pac, .sa) set is required")}
+	}
+	return nil
+}
+
+func validateCVMReferenceKeys(ctx context.Context, storage cvmReferenceObjectStorage, keys []string) error {
+	for _, key := range keys {
+		size, statErr := storage.stat(ctx, key)
+		if statErr != nil || size <= 0 {
+			// Keep provider details out of task state and client-visible diagnostics.
+			return &CVMInputObjectError{
+				ReasonCode: "REFERENCE_DATABASE_FAILED",
+				err:        fmt.Errorf("required reference resource is missing or empty (%s)", path.Base(key)),
+			}
+		}
+	}
+	return nil
+}
+
+func (s *TaskService) preflightCVMReferences(ctx context.Context, genome, template string, inputs map[string]interface{}) error {
+	storageConfig, err := cvmReferenceStorageConfig(s.cfg.Storage)
+	if err != nil {
+		return &CVMInputObjectError{ReasonCode: "REFERENCE_DATABASE_FAILED", err: err}
+	}
+	storageConfig.S3Bucket = strings.TrimSpace(storageConfig.CVMReferenceBucket)
+	if storageConfig.S3Bucket == "" {
+		storageConfig.S3Bucket = defaultCVMReferenceBucket
+	}
+	storage, err := newS3Storage(ctx, storageConfig)
+	if err != nil {
+		return &CVMInputObjectError{ReasonCode: "REFERENCE_DATABASE_FAILED", err: fmt.Errorf("reference object storage is unavailable")}
+	}
+	requireDefaultBED := false
+	bed, bedErr := cvmAnalysisBEDInput(template, inputs)
+	if bedErr == nil && bed == path.Join("/mnt/data/database", genome+"_default.bed") {
+		requireDefaultBED = true
+	}
+	if template == "baseline_fix" {
+		return validateCVMBaselineReferences(ctx, storage, genome, requireDefaultBED)
+	}
+	return validateCVMReferenceObjects(ctx, storage, genome, requireDefaultBED)
+}

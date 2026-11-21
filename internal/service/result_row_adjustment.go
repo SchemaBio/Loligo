@@ -1,0 +1,524 @@
+package service
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/SchemaBio/Loligo/internal/assistance"
+	"github.com/SchemaBio/Loligo/internal/database"
+	"github.com/SchemaBio/Loligo/internal/model"
+	"github.com/google/uuid"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+	"gorm.io/gorm/logger"
+)
+
+var ErrAdjustmentConflict = errors.New("RESULT_ADJUSTMENT_VERSION_CONFLICT")
+
+type ACMGEvidenceEntry struct {
+	Code     string `json:"code"`
+	Strength string `json:"strength"`
+	Source   string `json:"source,omitempty"`
+	Note     string `json:"note,omitempty"`
+}
+
+type ACMGAssessmentResult struct {
+	Profile        string              `json:"profile"`
+	Score          int                 `json:"score"`
+	State          string              `json:"state"`
+	Classification string              `json:"classification,omitempty"`
+	Evidence       []ACMGEvidenceEntry `json:"evidence"`
+	Pending        []string            `json:"pending"`
+}
+
+func CalculateSNVACMG(evidence []ACMGEvidenceEntry, manualOverride string) (ACMGAssessmentResult, error) {
+	result := ACMGAssessmentResult{Profile: automaticACMGProfile, State: "insufficient_evidence", Evidence: append([]ACMGEvidenceEntry(nil), evidence...), Pending: []string{"疾病机制、病例/家系及实验室证据需结合具体疾病和专家组规范评估"}}
+	seen := map[string]bool{}
+	positiveComputational, negativeComputational := false, false
+	standaloneBenign := false
+	for _, item := range evidence {
+		code := strings.ToUpper(strings.TrimSpace(item.Code))
+		strength := strings.ToLower(strings.TrimSpace(item.Strength))
+		if !validACMGCriterion(code) {
+			return result, fmt.Errorf("unsupported ACMG evidence code")
+		}
+		if code == "" || seen[code] {
+			return result, fmt.Errorf("ACMG evidence codes must be unique")
+		}
+		seen[code] = true
+		if code == "BA1" {
+			if strength != "standalone" {
+				return result, fmt.Errorf("BA1 has standalone strength")
+			}
+			standaloneBenign = true
+			continue
+		}
+		if code == "PP3" {
+			if positiveComputational {
+				return result, fmt.Errorf("PP3 may only be counted once")
+			}
+			positiveComputational = true
+		}
+		if code == "BP4" {
+			if negativeComputational {
+				return result, fmt.Errorf("BP4 may only be counted once")
+			}
+			negativeComputational = true
+		}
+		points := 0
+		if strings.HasPrefix(code, "P") {
+			switch strength {
+			case "supporting":
+				points = 1
+			case "moderate":
+				points = 2
+			case "strong":
+				points = 4
+			case "very_strong":
+				points = 8
+			default:
+				return result, fmt.Errorf("invalid pathogenic evidence strength")
+			}
+		} else if strings.HasPrefix(code, "B") {
+			switch strength {
+			case "supporting":
+				points = -1
+			case "moderate":
+				points = -2
+			case "strong":
+				points = -4
+			default:
+				return result, fmt.Errorf("invalid benign evidence strength")
+			}
+		} else {
+			return result, fmt.Errorf("unsupported ACMG evidence code")
+		}
+		result.Score += points
+	}
+	if positiveComputational && negativeComputational {
+		return result, fmt.Errorf("PP3 and BP4 are mutually exclusive")
+	}
+	if standaloneBenign {
+		if len(evidence) != 1 {
+			return result, fmt.Errorf("BA1 standalone cannot be combined with other criteria")
+		}
+		result.Classification = "Benign"
+	} else {
+		switch {
+		case result.Score >= 10:
+			result.Classification = "Pathogenic"
+		case result.Score >= 6:
+			result.Classification = "Likely_Pathogenic"
+		case result.Score <= -7:
+			result.Classification = "Benign"
+		case result.Score <= -1:
+			result.Classification = "Likely_Benign"
+		case len(evidence) > 0:
+			result.Classification = "VUS"
+		}
+	}
+	if result.Classification != "" {
+		result.State = "classified"
+	}
+	if manualOverride != "" {
+		switch manualOverride {
+		case "Pathogenic", "Likely_Pathogenic", "VUS", "Likely_Benign", "Benign":
+		default:
+			return result, fmt.Errorf("invalid manual ACMG override")
+		}
+		result.Classification = manualOverride
+		result.State = "manual_override"
+	}
+	return result, nil
+}
+
+func validACMGCriterion(code string) bool {
+	valid := map[string]bool{
+		"PVS1": true, "PS1": true, "PS2": true, "PS3": true, "PS4": true,
+		"PM1": true, "PM2": true, "PM3": true, "PM4": true, "PM5": true, "PM6": true,
+		"PP1": true, "PP2": true, "PP3": true, "PP4": true, "PP5": true,
+		"BA1": true, "BS1": true, "BS2": true, "BS3": true, "BS4": true,
+		"BP1": true, "BP2": true, "BP3": true, "BP4": true, "BP5": true, "BP6": true, "BP7": true,
+	}
+	return valid[code]
+}
+
+func (s *ResultService) SaveParquetRowAdjustment(ctx context.Context, task *model.Task, table, rowID, actor string, request model.ResultRowAdjustmentRequest) (*model.ResultRowAdjustment, *model.ResultRowAdjustmentEvent, error) {
+	if task != nil && task.InterpretationCompletedAt != nil {
+		return nil, nil, ErrInterpretationCompleted
+	}
+	if task == nil || !validParquetTable(table) || !validResultRowID(rowID) {
+		return nil, nil, fmt.Errorf("invalid result row identity")
+	}
+	if len(request.Reason) > 4000 {
+		return nil, nil, fmt.Errorf("adjustment reason is too long")
+	}
+	if request.ClientMutationID != "" {
+		if _, err := uuid.Parse(request.ClientMutationID); err != nil {
+			return nil, nil, fmt.Errorf("invalid mutation identity")
+		}
+	}
+	encoded, _ := json.Marshal(struct {
+		Actor, Task, Table, Row string
+		Request                 model.ResultRowAdjustmentRequest
+	}{actor, task.UUID, table, rowID, request})
+	fingerprint := sha256.Sum256(encoded)
+	requestHash := hex.EncodeToString(fingerprint[:])
+	if len(request.Adjustments) == 0 {
+		return nil, nil, fmt.Errorf("at least one adjustment is required")
+	}
+	allowed := map[string]bool{"svcv4AIResult": true, "svcv4Assessment": true, "activeAcmgVersion": true, "assessmentVersion": true, "resetAcmg": true, "pinned": true, "reviewed": true, "focused": true, "interpretation": true, "acmgEvidence": true, "acmgOverride": true, "acmgOverrideReason": true, "cnvAssessment": true}
+	if _, has := request.Adjustments["cnvAssessment"]; has && strings.TrimSpace(request.Reason) == "" {
+		return nil, nil, fmt.Errorf("CNV evidence changes require an adjustment reason")
+	}
+	for key, value := range request.Adjustments {
+		if (strings.HasPrefix(key, "acmg") || key == "resetAcmg") && table != "snv-indel" {
+			return nil, nil, fmt.Errorf("ACMG small-variant evidence is only valid for SNP/InDel")
+		}
+		if !allowed[key] {
+			return nil, nil, fmt.Errorf("unsupported adjustment field")
+		}
+		switch key {
+		case "svcv4AIResult":
+			if table != "snv-indel" {
+				return nil, nil, fmt.Errorf("SVC AI result is only valid for SNP/InDel")
+			}
+			id, ok := value.(string)
+			if !ok {
+				return nil, nil, fmt.Errorf("SVC AI save accepts only a request ID")
+			}
+			if _, err := uuid.Parse(id); err != nil {
+				return nil, nil, fmt.Errorf("invalid SVC AI request")
+			}
+		case "svcv4Assessment", "activeAcmgVersion":
+			if table != "snv-indel" {
+				return nil, nil, fmt.Errorf("SVCv4 is only valid for SNP/InDel")
+			}
+			if key == "activeAcmgVersion" {
+				version, ok := value.(string)
+				if !ok || version != "legacy" && version != "svcv4" {
+					return nil, nil, fmt.Errorf("invalid ACMG version")
+				}
+			} else if _, ok := value.(map[string]interface{}); !ok {
+				return nil, nil, fmt.Errorf("invalid SVCv4 assessment")
+			}
+		case "assessmentVersion":
+			version, ok := value.(string)
+			if !ok || len(version) != 64 {
+				return nil, nil, fmt.Errorf("invalid assessment version")
+			}
+			var fixed model.ResultAssessmentContext
+			if err := database.DB.WithContext(ctx).Where("tenant_id=? AND task_uuid=? AND execution_attempt_id=? AND version=?", model.TenantIDForTask(task), task.UUID, executionAttempt(task), version).First(&fixed).Error; err != nil {
+				return nil, nil, ErrAdjustmentConflict
+			}
+		case "resetAcmg", "pinned", "reviewed", "focused":
+			if _, ok := value.(bool); !ok {
+				return nil, nil, fmt.Errorf("review and focus values must be boolean")
+			}
+		case "interpretation", "acmgOverrideReason":
+			if text, ok := value.(string); !ok || len(text) > 4000 {
+				return nil, nil, fmt.Errorf("adjustment text is invalid")
+			}
+		case "acmgOverride":
+			classification, ok := value.(string)
+			if !ok {
+				return nil, nil, fmt.Errorf("ACMG override must be a classification")
+			}
+			if classification != "" && classification != "Pathogenic" && classification != "Likely_Pathogenic" && classification != "VUS" && classification != "Likely_Benign" && classification != "Benign" {
+				return nil, nil, fmt.Errorf("invalid ACMG override classification")
+			}
+		case "acmgEvidence":
+			entries, ok := value.([]interface{})
+			if !ok || len(entries) > 40 {
+				return nil, nil, fmt.Errorf("ACMG evidence must be an array")
+			}
+		case "cnvAssessment":
+			if table != "cnv-segment" && table != "cnv-exon" {
+				return nil, nil, fmt.Errorf("CNV assessment is only valid for CNV rows")
+			}
+			if _, ok := value.(map[string]interface{}); !ok {
+				return nil, nil, fmt.Errorf("CNV assessment must be an object")
+			}
+			payload, err := json.Marshal(value)
+			if err != nil {
+				return nil, nil, fmt.Errorf("CNV assessment is invalid")
+			}
+			if err := validateCNVAssessmentPayload(payload, rowID); err != nil {
+				return nil, nil, err
+			}
+			if err := normalizeCNVScoring(value.(map[string]interface{})); err != nil {
+				return nil, nil, err
+			}
+		}
+	}
+	dataset, err := s.verifyBrowserRow(ctx, task, table, rowID, request.RowOrdinal)
+	if err != nil {
+		return nil, nil, err
+	}
+	if request.AttemptID != "" && request.AttemptID != executionAttempt(task) || request.DatasetVersion != "" && request.DatasetVersion != dataset.DataVersion {
+		return nil, nil, ErrAdjustmentConflict
+	}
+	if id, ok := request.Adjustments["svcv4AIResult"].(string); ok {
+		ai := assistance.New(database.DB, s.cfg.IsSaaS(), s.cfg.Overlay.BaseURL, s.cfg.Overlay.SharedSecret)
+		saved, err := ai.SavedSVCResult(ctx, model.TenantIDForTask(task), task.UUID, rowID, id)
+		if errors.Is(err, assistance.ErrLegacySVCBinding) && request.RowOrdinal != nil {
+			cache, readErr := s.historyDatasetCache(ctx, dataset)
+			if readErr != nil {
+				return nil, nil, readErr
+			}
+			page, readErr := NewParquetReader().ReadPage(cache, *request.RowOrdinal, 1)
+			if readErr != nil || len(page.Rows) != 1 {
+				return nil, nil, ErrParquetIncomplete
+			}
+			identity := normalizeParquetAPIItem(table, page.Rows[0])
+			identity["assembly"] = TaskReferenceGenome(task)
+			saved, err = ai.SavedLegacySVCResult(ctx, model.TenantIDForTask(task), task.UUID, rowID, id, identity)
+		}
+		if err != nil {
+			return nil, nil, err
+		}
+		original := request.Adjustments
+		request.Adjustments = make(map[string]interface{}, len(original))
+		for key, value := range original {
+			request.Adjustments[key] = value
+		}
+		request.Adjustments["svcv4AIResult"] = saved
+	}
+	// Submitted totals are never trusted; recompute before acquiring database locks.
+	if input, ok := request.Adjustments["svcv4Assessment"].(map[string]interface{}); ok {
+		original := request.Adjustments
+		request.Adjustments = make(map[string]interface{}, len(original))
+		for key, value := range original {
+			request.Adjustments[key] = value
+		}
+		computed, err := s.SVCv4(ctx, input)
+		if err != nil {
+			return nil, nil, err
+		}
+		request.Adjustments["svcv4Assessment"] = computed
+	}
+	if cnv, ok := request.Adjustments["cnvAssessment"].(map[string]interface{}); ok {
+		cache, err := s.historyDatasetCache(ctx, dataset)
+		if err != nil {
+			return nil, nil, err
+		}
+		if request.RowOrdinal == nil {
+			return nil, nil, ErrAdjustmentConflict
+		}
+		page, err := NewParquetReader().ReadPage(cache, *request.RowOrdinal, 1)
+		if err != nil || len(page.Rows) != 1 {
+			return nil, nil, ErrParquetIncomplete
+		}
+		if err := verifyCNVEventType(page.Rows[0], cnv); err != nil {
+			return nil, nil, err
+		}
+	}
+	tenant, attempt := model.TenantIDForTask(task), executionAttempt(task)
+	var historySource *model.HistoryFocus
+	if !s.cfg.IsSaaS() && request.Adjustments["focused"] == true {
+		var existing model.HistoryFocus
+		lookup := database.DB.WithContext(ctx).Where("id=?", historyFocusID(dataset, rowID)).First(&existing).Error
+		if errors.Is(lookup, gorm.ErrRecordNotFound) {
+			historySource, err = s.historySource(ctx, dataset, rowID, request.RowOrdinal)
+			if err != nil {
+				return nil, nil, err
+			}
+		} else if lookup != nil {
+			return nil, nil, lookup
+		}
+	}
+	var saved model.ResultRowAdjustment
+	var event model.ResultRowAdjustmentEvent
+	err = database.DB.WithContext(ctx).Session(&gorm.Session{Logger: logger.Default.LogMode(logger.Silent)}).Transaction(func(tx *gorm.DB) error {
+		var lockedTask model.Task
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("uuid=?", task.UUID).First(&lockedTask).Error; err != nil {
+			return err
+		}
+		if lockedTask.InterpretationCompletedAt != nil {
+			return ErrInterpretationCompleted
+		}
+		if executionAttempt(&lockedTask) != attempt {
+			return ErrAdjustmentConflict
+		}
+		var lockedDataset model.ResultDataset
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id=?", dataset.ID).First(&lockedDataset).Error; err != nil {
+			return err
+		}
+		if lockedDataset.DataVersion != dataset.DataVersion {
+			return ErrAdjustmentConflict
+		}
+		if request.ClientMutationID != "" {
+			var prior model.ResultRowAdjustmentEvent
+			err := tx.Where("tenant_id=? AND client_mutation_id=?", tenant, request.ClientMutationID).First(&prior).Error
+			if err == nil {
+				if prior.RequestSHA256 != requestHash {
+					return ErrAdjustmentConflict
+				}
+				event = prior
+				return tx.Where("tenant_id=? AND task_uuid=? AND execution_attempt_id=? AND \"table\"=? AND row_id=?", tenant, task.UUID, attempt, table, rowID).First(&saved).Error
+			}
+			if !errors.Is(err, gorm.ErrRecordNotFound) {
+				return err
+			}
+		}
+		nextRevision := lockedDataset.AdjustmentRevision + 1
+		var current model.ResultRowAdjustment
+		err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("tenant_id=? AND task_uuid=? AND execution_attempt_id=? AND \"table\"=? AND row_id=?", tenant, task.UUID, attempt, table, rowID).First(&current).Error
+		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+			return err
+		}
+		version := uint64(0)
+		payload := map[string]interface{}{}
+		if err == nil {
+			version = current.Version
+			if request.ExpectedVersion != version {
+				return ErrAdjustmentConflict
+			}
+			if err := json.Unmarshal([]byte(current.PayloadJSON), &payload); err != nil {
+				return fmt.Errorf("stored adjustment is invalid")
+			}
+		} else if request.ExpectedVersion != 0 {
+			return ErrAdjustmentConflict
+		}
+		before, _ := json.Marshal(payload)
+		for key, value := range request.Adjustments {
+			payload[key] = value
+		}
+		if focused, changed := request.Adjustments["focused"]; changed {
+			if focused == true {
+				payload["focusedBy"] = actor
+				payload["focusedAt"] = time.Now().UTC().Format(time.RFC3339Nano)
+			} else {
+				delete(payload, "focusedBy")
+				delete(payload, "focusedAt")
+			}
+		}
+		if request.Adjustments["resetAcmg"] == true {
+			for key := range payload {
+				if strings.HasPrefix(key, "acmg") || key == "resetAcmg" {
+					delete(payload, key)
+				}
+			}
+		}
+		_, evidenceChanged := request.Adjustments["acmgEvidence"]
+		_, overrideChanged := request.Adjustments["acmgOverride"]
+		if raw, ok := payload["acmgEvidence"]; ok && (evidenceChanged || overrideChanged) {
+			data, _ := json.Marshal(raw)
+			var evidence []ACMGEvidenceEntry
+			if err := json.Unmarshal(data, &evidence); err != nil {
+				return fmt.Errorf("ACMG evidence is invalid")
+			}
+			assessment, err := CalculateSNVACMG(evidence, "")
+			if err != nil {
+				return err
+			}
+			payload["acmgClassificationComputed"] = assessment.Classification
+			override := strings.TrimSpace(stringAdjustment(payload, "acmgOverride"))
+			if override != "" {
+				assessment.Classification = override
+				assessment.State = "manual_override"
+			}
+			payload["acmgClassification"] = assessment.Classification
+			payload["acmgScore"] = assessment.Score
+			payload["acmgProfile"] = assessment.Profile
+			payload["acmgState"] = assessment.State
+		}
+		if err := validateActiveACMG(payload); err != nil {
+			return err
+		}
+		after, err := json.Marshal(payload)
+		if err != nil {
+			return err
+		}
+		saved = model.ResultRowAdjustment{DatasetVersion: dataset.DataVersion, TenantID: tenant, TaskUUID: task.UUID, ExecutionAttemptID: attempt, Table: table, RowID: rowID, PayloadJSON: string(after), Version: version + 1, UpdatedBy: actor, UpdatedAt: time.Now().UTC()}
+		saved.Revision = nextRevision
+		if err := persistParquetAdjustment(tx, &saved, version); err != nil {
+			return err
+		}
+		event = model.ResultRowAdjustmentEvent{ID: uuid.NewString(), TenantID: tenant, TaskUUID: task.UUID, ExecutionAttemptID: attempt, Table: table, RowID: rowID, BeforeJSON: string(before), AfterJSON: string(after), Reason: strings.TrimSpace(request.Reason), Actor: actor, CreatedAt: time.Now().UTC()}
+		event.Revision, event.DatasetVersion = nextRevision, dataset.DataVersion
+		if request.ClientMutationID != "" {
+			event.ClientMutationID = &request.ClientMutationID
+			event.RequestSHA256 = requestHash
+		}
+		if err := tx.Model(&model.ResultDataset{}).Where("id=?", dataset.ID).Update("adjustment_revision", nextRevision).Error; err != nil {
+			return err
+		}
+		if err := tx.Create(&event).Error; err != nil {
+			return err
+		}
+		if s.cfg.IsSaaS() {
+			return nil
+		}
+		return persistHistoryFocus(tx, &lockedTask, &lockedDataset, &saved, &event, historySource)
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	return &saved, &event, nil
+}
+
+func (s *ResultService) GetParquetRowAdjustment(ctx context.Context, task *model.Task, table, rowID string) (*model.ResultRowAdjustment, error) {
+	if task == nil || !validParquetTable(table) || !validResultRowID(rowID) {
+		return nil, fmt.Errorf("invalid result row identity")
+	}
+	if _, err := s.verifyParquetRow(ctx, task, table, rowID); err != nil {
+		return nil, err
+	}
+	var current model.ResultRowAdjustment
+	err := database.DB.WithContext(ctx).Where("tenant_id=? AND task_uuid=? AND execution_attempt_id=? AND \"table\"=? AND row_id=?", model.TenantIDForTask(task), task.UUID, executionAttempt(task), table, rowID).First(&current).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return &model.ResultRowAdjustment{Version: 0, PayloadJSON: "{}"}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &current, nil
+}
+
+func (s *ResultService) ListParquetRowAdjustmentEvents(ctx context.Context, task *model.Task, table, rowID string) ([]model.ResultRowAdjustmentEvent, error) {
+	if task == nil || !validParquetTable(table) || !validResultRowID(rowID) {
+		return nil, fmt.Errorf("invalid result row identity")
+	}
+	if _, err := s.verifyParquetRow(ctx, task, table, rowID); err != nil {
+		return nil, err
+	}
+	var rows []model.ResultRowAdjustmentEvent
+	err := database.DB.WithContext(ctx).Where("tenant_id=? AND task_uuid=? AND execution_attempt_id=? AND \"table\"=? AND row_id=?", model.TenantIDForTask(task), task.UUID, executionAttempt(task), table, rowID).Order("created_at DESC").Limit(200).Find(&rows).Error
+	return rows, err
+}
+
+func executionAttempt(task *model.Task) string {
+	if task.ExecutionAttemptID != "" {
+		return task.ExecutionAttemptID
+	}
+	return task.UUID
+}
+
+func stringAdjustment(payload map[string]interface{}, key string) string {
+	value, _ := payload[key].(string)
+	return value
+}
+
+func persistParquetAdjustment(tx *gorm.DB, saved *model.ResultRowAdjustment, version uint64) error {
+	var write *gorm.DB
+	if version == 0 {
+		write = tx.Clauses(clause.OnConflict{DoNothing: true}).Create(saved)
+	} else {
+		write = tx.Model(&model.ResultRowAdjustment{}).Where("tenant_id=? AND task_uuid=? AND execution_attempt_id=? AND \"table\"=? AND row_id=? AND version=?", saved.TenantID, saved.TaskUUID, saved.ExecutionAttemptID, saved.Table, saved.RowID, version).
+			Updates(map[string]interface{}{"revision": saved.Revision, "dataset_version": saved.DatasetVersion, "payload_json": saved.PayloadJSON, "version": saved.Version, "updated_by": saved.UpdatedBy, "updated_at": saved.UpdatedAt})
+	}
+	if write.Error != nil {
+		return write.Error
+	}
+	if write.RowsAffected != 1 {
+		return ErrAdjustmentConflict
+	}
+	return nil
+}

@@ -1,0 +1,3649 @@
+package service
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/url"
+	"os"
+	"os/exec"
+	"path"
+	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/SchemaBio/Loligo/internal/config"
+	"github.com/SchemaBio/Loligo/internal/database"
+	"github.com/SchemaBio/Loligo/internal/model"
+	"github.com/SchemaBio/Loligo/internal/pathsafe"
+	"github.com/SchemaBio/Loligo/internal/repository"
+	"github.com/SchemaBio/Loligo/internal/retention"
+	"github.com/SchemaBio/Loligo/internal/sepiida"
+	"github.com/SchemaBio/Loligo/internal/workflow"
+	"github.com/google/uuid"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+)
+
+type TaskService struct {
+	cfg             *config.Config
+	sepiida         *sepiida.Client
+	overlay         *OverlayClient
+	repo            *repository.TaskRepository
+	importBatchRepo *repository.ResultImportBatchRepository
+	uploadJobRepo   *repository.UploadJobRepository
+	uploadFileRepo  *repository.UploadFileRepository
+	assetRepo       *repository.DataAssetRepository
+	sampleRepo      *repository.SampleRepository
+	pipelineRepo    *repository.PipelineRepository
+	baselineRepo    *repository.CNVBaselineRepository
+	pedigreeRepo    *repository.PedigreeRepository
+	mu              sync.RWMutex
+	running         map[string]*exec.Cmd
+}
+
+const maxTaskLogBytes = 2 << 20
+
+func (s *TaskService) estimateTaskMinutes(sampleID uint, uploadJob *model.UploadJob) int {
+	if sampleID != 0 {
+		var link model.SampleDataLink
+		if err := database.GetDB().Where("sample_id = ?", sampleID).First(&link).Error; err == nil {
+			read1, read1Err := s.assetRepo.FindByID(link.Read1AssetID)
+			read2, read2Err := s.assetRepo.FindByID(link.Read2AssetID)
+			if read1Err == nil && read2Err == nil &&
+				read1.Status == model.FileStatusCompleted && read2.Status == model.FileStatusCompleted &&
+				read1.FileSize > 0 && read2.FileSize > 0 {
+				return estimateTaskMinutesFromBytes(read1.FileSize + read2.FileSize)
+			}
+		}
+	}
+
+	if uploadJob != nil && uploadJob.Status == model.UploadJobStatusCompleted {
+		files, err := s.uploadFileRepo.FindByJobID(uploadJob.ID)
+		if err == nil {
+			var read1Bytes, read2Bytes int64
+			for i := range files {
+				if files[i].Status != model.FileStatusCompleted || files[i].FileSize <= 0 {
+					continue
+				}
+				switch files[i].ReadType {
+				case model.ReadTypeRead1:
+					read1Bytes = files[i].FileSize
+				case model.ReadTypeRead2:
+					read2Bytes = files[i].FileSize
+				}
+			}
+			if read1Bytes > 0 && read2Bytes > 0 {
+				return estimateTaskMinutesFromBytes(read1Bytes + read2Bytes)
+			}
+		}
+	}
+
+	return defaultTaskEstimatedMinutes
+}
+
+// EstimateTask returns the same authoritative runtime estimate that CreateTask
+// persists and later sends to Onykia for credit pre-deduction.
+func (s *TaskService) EstimateTask(req *model.TaskEstimateRequest, actor model.OverlayActor) (*model.TaskEstimateResponse, error) {
+	createReq := model.TaskCreateRequest{
+		SampleID:   strings.TrimSpace(req.SampleID),
+		PedigreeID: strings.TrimSpace(req.PedigreeID),
+		PipelineID: strings.TrimSpace(req.PipelineID),
+		VCFAssetID: req.VCFAssetID, VCFSampleName: req.VCFSampleName,
+		Inputs: make(map[string]interface{}),
+	}
+	if _, err := s.resolveAnalysisPipeline(&createReq, actor); err != nil {
+		return nil, err
+	}
+
+	var sample *model.Sample
+	var err error
+	if createReq.Template == "trio" {
+		sample, _, err = s.prepareSampleTrio(createReq.SampleID, createReq.PedigreeID, "estimate", actor, createReq.Inputs)
+	} else {
+		if createReq.SampleID == "" {
+			return nil, fmt.Errorf("sampleId is required for single-sample analysis")
+		}
+		sample, err = s.sampleRepo.FindScopedByUUID(createReq.SampleID, actor)
+	}
+	if err != nil || sample == nil {
+		if err != nil {
+			return nil, err
+		}
+		return nil, fmt.Errorf("analysis input data is not available")
+	}
+
+	if createReq.Template == "vcf2anno" {
+		if _, err := s.resolveVCFAsset(&createReq, actor); err != nil {
+			return nil, err
+		}
+		return &model.TaskEstimateResponse{EstimatedMinutes: vcfAnnotationEstimatedMinutes}, nil
+	}
+	if createReq.Template == "trio" {
+		return &model.TaskEstimateResponse{EstimatedMinutes: trioEstimatedMinutes(createReq.Inputs)}, nil
+	}
+	return &model.TaskEstimateResponse{EstimatedMinutes: s.estimateTaskMinutes(sample.ID, nil)}, nil
+}
+
+func NewTaskService(cfg *config.Config) *TaskService {
+	var sepClient *sepiida.Client
+	if cfg.Sepiida.Enabled && cfg.Sepiida.QueryKey != "" {
+		sepClient = sepiida.NewClient(cfg.Sepiida.ServerURL, cfg.Sepiida.QueryKey)
+	}
+
+	svc := &TaskService{
+		cfg:             cfg,
+		sepiida:         sepClient,
+		overlay:         NewOverlayClient(cfg.Overlay),
+		repo:            repository.NewTaskRepository(),
+		importBatchRepo: repository.NewResultImportBatchRepository(),
+		uploadJobRepo:   repository.NewUploadJobRepository(),
+		uploadFileRepo:  repository.NewUploadFileRepository(),
+		assetRepo:       repository.NewDataAssetRepository(),
+		sampleRepo:      repository.NewSampleRepository(),
+		pipelineRepo:    repository.NewPipelineRepository(),
+		baselineRepo:    repository.NewCNVBaselineRepository(),
+		pedigreeRepo:    repository.NewPedigreeRepository(),
+		running:         make(map[string]*exec.Cmd),
+	}
+
+	if cfg.Storage.BAMRetentionDays == 7 {
+		svc.repo.EnableBAMRetention(cfg.Storage.S3Bucket)
+	}
+	return svc
+}
+
+func (s *TaskService) admitTask(ctx context.Context, action string, actor model.OverlayActor, task *model.Task) error {
+	if s.overlay == nil {
+		return nil
+	}
+	return s.overlay.AdmitTask(ctx, model.OverlayTaskAdmissionRequest{
+		Action:      action,
+		Actor:       actor,
+		Task:        model.NewOverlayTaskSnapshot(task),
+		RequestedAt: time.Now(),
+	})
+}
+
+func (s *TaskService) emitTaskEvent(event string, actor model.OverlayActor, task *model.Task, previousStatus model.TaskStatus, message string) {
+	if err := s.emitTaskEventWithError(event, actor, task, previousStatus, message); err != nil {
+		fmt.Printf("WARNING: overlay task event %s failed for %s: %v\n", event, task.UUID, err)
+	}
+}
+
+func (s *TaskService) emitTaskEventWithError(event string, actor model.OverlayActor, task *model.Task, previousStatus model.TaskStatus, message string) error {
+	if s.overlay == nil || task == nil {
+		return nil
+	}
+	req := model.OverlayTaskEventRequest{
+		Event:          event,
+		Actor:          actor,
+		Task:           model.NewOverlayTaskSnapshot(task),
+		PreviousStatus: previousStatus,
+		OccurredAt:     time.Now(),
+		Message:        message,
+	}
+	if task.Executor == model.ExecutorCVM && task.ExecutionAttemptID != "" && task.Version > 0 {
+		req.EventID = model.ExecutionEventID(task.ExecutionAttemptID, task.Version, event)
+		req.Version = task.Version
+	}
+	return s.overlay.EmitTaskEvent(context.Background(), req)
+}
+
+func (s *TaskService) emitStatusEvent(task *model.Task, previousStatus model.TaskStatus) {
+	if task == nil || previousStatus == task.Status {
+		return
+	}
+	event := ""
+	switch task.Status {
+	case model.TaskStatusQueued, model.TaskStatusWaitingData:
+		event = model.OverlayTaskEventQueued
+	case model.TaskStatusRunning:
+		event = model.OverlayTaskEventRunning
+	case model.TaskStatusCompleted:
+		event = model.OverlayTaskEventCompleted
+	case model.TaskStatusFailed:
+		event = model.OverlayTaskEventFailed
+	case model.TaskStatusCancelled:
+		event = model.OverlayTaskEventCancelled
+	}
+	if event != "" {
+		s.emitTaskEvent(event, model.OverlayActor{}, task, previousStatus, task.Error)
+	}
+}
+
+// StartSepiidaSync begins periodic syncing of task status from Sepiida.
+// Should be called once at server startup.
+func (s *TaskService) StartSepiidaSync(ctx context.Context, interval time.Duration) {
+	if s.sepiida == nil {
+		return
+	}
+
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				s.syncRunningTaskStatuses()
+			}
+		}
+	}()
+}
+
+// syncRunningTaskStatuses queries Sepiida for all "running" tasks in Loligo DB
+// and updates their status based on Sepiida's authoritative workflow state.
+func (s *TaskService) syncRunningTaskStatuses() {
+	var tasks []model.Task
+	query := database.GetDB().Where("status = ? OR (executor = ? AND status = ? AND execution_phase IN ?)", model.TaskStatusRunning, model.ExecutorCVM, model.TaskStatusQueued, []string{"bootstrapping", "running", "archiving"})
+	if !s.cfg.IsSaaS() {
+		// A completed local workflow can still be waiting for Agent archiving.
+		// Keep observing it until the first import, without retrying real errors.
+		query = query.Or("status = ? AND executor IN ? AND result_import_status IN ?", model.TaskStatusCompleted,
+			[]model.ExecutorType{model.ExecutorLocal, model.ExecutorSlurm, model.ExecutorLSF},
+			[]model.ResultImportStatus{model.ResultImportStatusPending, ""})
+	}
+	err := query.Find(&tasks).Error
+	if err != nil {
+		return
+	}
+
+	for _, task := range tasks {
+		s.syncTaskFromSepiida(&task)
+	}
+
+	pending, err := s.repo.FindPendingCVMArchiveTermination()
+	if err != nil {
+		return
+	}
+	for i := range pending {
+		s.notifyCVMArchiveCompletion(&pending[i])
+	}
+}
+
+// applySepiidaWorkflowStatus copies MiniWDL/Sepiida status onto an Loligo
+// task. CVM executions do not take a business terminal state from Sepiida
+// failed/cancelled reports: those can be replayed with a stolen task token.
+// Local executors still treat Sepiida as authoritative.
+func applySepiidaWorkflowStatus(task *model.Task, status model.SepiidaStatus) (changed bool, completedNow bool) {
+	if task == nil {
+		return false, false
+	}
+	phaseChanged := false
+	if task.Executor != model.ExecutorCVM &&
+		(status == model.SepiidaStatusSuccess || status == model.SepiidaStatusFailed || status == model.SepiidaStatusCancelled) && task.ExecutionPhase != "terminal" {
+		now := time.Now().UTC()
+		task.ExecutionPhase = "terminal"
+		task.PhaseUpdatedAt = &now
+		phaseChanged = true
+	}
+	switch status {
+	case model.SepiidaStatusRunning:
+		// A delayed progress report must not undo the newer CVM archive phase.
+		if task.Executor == model.ExecutorCVM && task.ExecutionPhase == "archiving" {
+			return false, false
+		}
+		phaseChanged := task.ExecutionPhase != "running"
+		if task.Status != model.TaskStatusRunning || phaseChanged || task.StartedAt == nil {
+			task.Status = model.TaskStatusRunning
+			task.ExecutionPhase = "running"
+			if phaseChanged {
+				now := time.Now().UTC()
+				task.PhaseUpdatedAt = &now
+			}
+			if task.StartedAt == nil {
+				now := time.Now().UTC()
+				task.StartedAt = &now
+			}
+			return true, false
+		}
+	case model.SepiidaStatusSuccess:
+		if task.Status != model.TaskStatusCompleted {
+			task.Status = model.TaskStatusCompleted
+			task.Progress = 100
+			task.Error = ""
+			now := time.Now()
+			task.FinishedAt = &now
+			return true, true
+		}
+	case model.SepiidaStatusFailed:
+		if task.Executor == model.ExecutorCVM {
+			const msg = "Sepiida reported workflow failure; waiting for CVM lifecycle"
+			if task.Error != msg {
+				task.Error = msg
+				return true, false
+			}
+			return false, false
+		}
+		if task.Status != model.TaskStatusFailed {
+			task.Status = model.TaskStatusFailed
+			task.Error = "Workflow failed (reported by Sepiida)"
+			now := time.Now()
+			task.FinishedAt = &now
+			return true, false
+		}
+	case model.SepiidaStatusCancelled:
+		if task.Executor == model.ExecutorCVM {
+			const msg = "Sepiida reported workflow cancellation; waiting for CVM lifecycle"
+			if task.Error != msg {
+				task.Error = msg
+				return true, false
+			}
+			return false, false
+		}
+		if task.Status != model.TaskStatusCancelled {
+			task.Status = model.TaskStatusCancelled
+			now := time.Now()
+			task.FinishedAt = &now
+			return true, false
+		}
+	}
+	return phaseChanged, false
+}
+
+func (s *TaskService) syncTaskFromSepiida(task *model.Task) {
+	if s.sepiida == nil || task.UUID == "" {
+		return
+	}
+	attemptID := task.ExecutionAttemptID
+	// A user cancellation (or a completed cleanup) owns the attempt lifecycle.
+	// Sepiida may still report the last workflow state for a short time, but it
+	// must not resurrect a terminating CVM execution or stage a second archive.
+	if task.Executor == model.ExecutorCVM && (task.ExecutionPhase == "terminating" || task.ExecutionPhase == "terminal") {
+		return
+	}
+
+	sepiidaWorkflow, tasks, err := s.sepiida.GetWorkflowWithTasks(task.UUID, sepiidaWorkflowAgentID(task))
+	var agentSession *model.SepiidaAgentSession
+	if task.Executor == model.ExecutorCVM {
+		if session, statusErr := s.sepiida.GetAgentStatus(task.UUID, attemptID); statusErr == nil {
+			agentSession = session
+		}
+	}
+	if task.Executor == model.ExecutorCVM {
+		latest, latestErr := s.repo.FindByUUID(task.UUID)
+		if latestErr != nil || latest == nil || latest.ExecutionAttemptID != attemptID || latest.ExecutionPhase == "terminating" || latest.ExecutionPhase == "terminal" {
+			return
+		}
+		*task = *latest
+	}
+	if agentSession != nil && agentSession.LastProgressPushAt != nil {
+		s.recordSepiidaFirstReport(task, agentSession.LastProgressPushAt)
+	}
+	if err != nil {
+		if errors.Is(err, sepiida.ErrNotFound) {
+			s.clearSepiidaQueryDegraded(task)
+			s.timeoutMissingSepiidaFirstReport(task, false)
+		} else {
+			s.timeoutMissingSepiidaFirstReport(task, true)
+		}
+		return
+	}
+	if sepiidaWorkflow == nil {
+		s.clearSepiidaQueryDegraded(task)
+		s.timeoutMissingSepiidaFirstReport(task, false)
+		return
+	}
+	if !s.currentWorkflowReport(task, sepiidaWorkflow) {
+		return
+	}
+	s.clearSepiidaQueryDegraded(task)
+	s.recordSepiidaFirstReport(task, nil)
+	previousStatus := task.Status
+	archiveMetadata := sepiidaWorkflow.NormalizedArchiveMetadata()
+	if task.Executor == model.ExecutorCVM && sepiidaWorkflow.Status == model.SepiidaStatusSuccess {
+		if !archiveMetadata.Archived {
+			// Sepiida can report workflow success before the archive callback is
+			// accepted by Sepiida. Keep the business status stable until the
+			// archive is verified, but expose the actual lifecycle phase so a
+			// dropped callback does not leave the UI showing "calculating".
+			changedPhase := task.ExecutionPhase != "archiving"
+			if changedPhase {
+				task.ExecutionPhase = "archiving"
+				now := time.Now().UTC()
+				task.PhaseUpdatedAt = &now
+			}
+			if task.Progress < 99 {
+				task.Progress = 99
+				changedPhase = true
+			}
+			if changedPhase {
+				task.UpdatedAt = time.Now()
+				if err := s.repo.Update(task); err != nil {
+					fmt.Printf("WARNING: persist CVM archive phase for task %s: %v\\n", task.UUID, err)
+				}
+			}
+			return
+		}
+		if err := s.stageCVMArchive(task, archiveMetadata); err != nil {
+			fmt.Printf("WARNING: stage COS archive for task %s: %v\n", task.UUID, err)
+			return
+		}
+	}
+
+	s.mu.Lock()
+	changed, completedNow := applySepiidaWorkflowStatus(task, sepiidaWorkflow.Status)
+	if sepiidaWorkflow.Status == model.SepiidaStatusRunning {
+		analysis := workflow.CalculateAnalysisProgress(task.Template, tasks, false)
+		if task.Progress < analysis.Percent {
+			task.Progress = analysis.Percent
+			changed = true
+		}
+	}
+
+	if changed {
+		task.UpdatedAt = time.Now()
+		if err := s.repo.Update(task); err != nil {
+			s.mu.Unlock()
+			fmt.Printf("WARNING: persist Sepiida task status for %s: %v\n", task.UUID, err)
+			return
+		}
+		s.syncCNVBaselineOutput(task, sepiidaWorkflow.OutputsJSON)
+		s.emitStatusEvent(task, previousStatus)
+	}
+	s.mu.Unlock()
+
+	if completedNow || (!s.cfg.IsSaaS() && task.Executor != model.ExecutorCVM && task.Status == model.TaskStatusCompleted &&
+		(task.ResultImportStatus == model.ResultImportStatusPending || task.ResultImportStatus == "")) {
+		s.importTaskArchive(task)
+	}
+	if task.Executor == model.ExecutorCVM {
+		s.notifyCVMArchiveCompletion(task)
+	}
+}
+
+func (s *TaskService) timeoutMissingSepiidaFirstReport(task *model.Task, queryUnavailable bool) {
+	if task == nil || database.GetDB() == nil {
+		return
+	}
+	attemptID := task.ExecutionAttemptID
+	timeout := s.cfg.Sepiida.FirstReportTimeout
+	grace := s.cfg.Sepiida.QueryGracePeriod
+	if queryUnavailable {
+		if task.SepiidaQueryDegradedAt == nil {
+			now := time.Now().UTC()
+			query := database.GetDB().Model(&model.Task{}).Where("uuid = ? AND execution_attempt_id = ? AND sepiida_query_degraded_at IS NULL", task.UUID, task.ExecutionAttemptID)
+			if err := query.Update("sepiida_query_degraded_at", now).Error; err == nil {
+				task.SepiidaQueryDegradedAt = &now
+			}
+		}
+		if !sepiidaQueryUnavailableOverdue(task, timeout, grace, time.Now().UTC()) {
+			return
+		}
+	} else if !sepiidaFirstReportOverdue(task, timeout, time.Now().UTC()) {
+		return
+	}
+
+	reasonCode := "SEPIIDA_FIRST_REPORT_TIMEOUT"
+	message := "Sepiida did not receive the first workflow progress report before the deadline"
+	if queryUnavailable {
+		reasonCode = "SEPIIDA_QUERY_UNAVAILABLE"
+		message = "Sepiida remained unavailable while confirming the first workflow progress report"
+	}
+	var current model.Task
+	err := database.GetDB().Transaction(func(tx *gorm.DB) error {
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("uuid = ? AND execution_attempt_id = ?", task.UUID, attemptID).First(&current).Error; err != nil {
+			return err
+		}
+		overdue := sepiidaFirstReportOverdue(&current, timeout, time.Now().UTC())
+		if queryUnavailable {
+			overdue = sepiidaQueryUnavailableOverdue(&current, timeout, grace, time.Now().UTC())
+		}
+		if current.ExecutionAttemptID != attemptID || attemptID == "" || !overdue || current.Status != model.TaskStatusRunning {
+			return nil
+		}
+		now := time.Now().UTC()
+		current.Status = model.TaskStatusFailed
+		current.FinishedAt = &now
+		current.ExecutionPhase = "terminating"
+		current.ExecutionReasonCode = reasonCode
+		current.Error = message
+		current.VMStatus = "TERMINATING"
+		current.PhaseUpdatedAt = &now
+		current.Version++
+		if err := tx.Save(&current).Error; err != nil {
+			return err
+		}
+		request := model.CVMCancelRequest{TaskUUID: current.UUID, AttemptID: current.ExecutionAttemptID, Reason: model.OverlayTaskEventFailed}
+		payload, err := json.Marshal(request)
+		if err != nil {
+			return err
+		}
+		if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&model.CVMCancellation{
+			AttemptID: current.ExecutionAttemptID, TaskUUID: current.UUID, Payload: string(payload), NextRetryAt: now,
+		}).Error; err != nil {
+			return err
+		}
+		return tx.Model(&model.CVMSubmission{}).Where("attempt_id = ? AND delivered = FALSE", current.ExecutionAttemptID).Updates(map[string]interface{}{
+			"delivered": true, "last_error": "dispatch cancelled after Sepiida first-report timeout",
+		}).Error
+	})
+	if err != nil {
+		fmt.Printf("WARNING: enforce Sepiida first-report timeout for task %s: %v\n", task.UUID, err)
+		return
+	}
+	if current.UUID != "" {
+		*task = current
+	}
+}
+
+func sepiidaQueryUnavailableOverdue(task *model.Task, timeout, grace time.Duration, now time.Time) bool {
+	if task == nil || grace < 0 || !sepiidaFirstReportEligible(task) || timeout <= 0 {
+		return false
+	}
+	return !now.Before(task.SepiidaFirstReportExpectedAt.Add(timeout + grace))
+}
+
+func sepiidaFirstReportEligible(task *model.Task) bool {
+	return task != nil && task.Executor == model.ExecutorCVM && task.SepiidaFirstReportedAt == nil &&
+		task.SepiidaFirstReportExpectedAt != nil && (task.ExecutionPhase == "running" || task.ExecutionPhase == "archiving")
+}
+
+func (s *TaskService) recordSepiidaFirstReport(task *model.Task, reportedAt *time.Time) {
+	if task == nil || task.SepiidaFirstReportedAt != nil || database.GetDB() == nil {
+		return
+	}
+	now := time.Now().UTC()
+	if reportedAt != nil {
+		now = reportedAt.UTC()
+	}
+	query := database.GetDB().Model(&model.Task{}).Where("uuid = ? AND sepiida_first_reported_at IS NULL", task.UUID)
+	if task.Executor == model.ExecutorCVM {
+		query = query.Where("execution_attempt_id = ?", task.ExecutionAttemptID)
+	}
+	result := query.Update("sepiida_first_reported_at", now)
+	if result.Error == nil && result.RowsAffected == 1 {
+		task.SepiidaFirstReportedAt = &now
+	} else if result.Error == nil && task.Executor == model.ExecutorCVM {
+		var current model.Task
+		if database.GetDB().Where("uuid = ? AND execution_attempt_id = ?", task.UUID, task.ExecutionAttemptID).First(&current).Error == nil {
+			task.SepiidaFirstReportedAt = current.SepiidaFirstReportedAt
+		}
+	}
+}
+
+func (s *TaskService) clearSepiidaQueryDegraded(task *model.Task) {
+	if task == nil || task.SepiidaQueryDegradedAt == nil || database.GetDB() == nil {
+		return
+	}
+	if err := database.GetDB().Model(&model.Task{}).Where("uuid = ? AND execution_attempt_id = ?", task.UUID, task.ExecutionAttemptID).Update("sepiida_query_degraded_at", nil).Error; err == nil {
+		task.SepiidaQueryDegradedAt = nil
+	}
+}
+
+func sepiidaFirstReportOverdue(task *model.Task, timeout time.Duration, now time.Time) bool {
+	if task == nil || timeout <= 0 || task.Executor != model.ExecutorCVM || task.SepiidaFirstReportedAt != nil || task.SepiidaFirstReportExpectedAt == nil {
+		return false
+	}
+	if task.ExecutionPhase != "running" && task.ExecutionPhase != "archiving" {
+		return false
+	}
+	return !now.Before(task.SepiidaFirstReportExpectedAt.Add(timeout))
+}
+
+func (s *TaskService) stageCVMArchive(task *model.Task, metadata model.SepiidaArchiveMetadata) error {
+	if task == nil || task.Executor != model.ExecutorCVM {
+		return fmt.Errorf("CVM task is required")
+	}
+	if task.CVMArchiveStagedAt != nil {
+		return nil
+	}
+	if task.ExecutionPhase != "archiving" || task.Progress < 99 {
+		now := time.Now().UTC()
+		task.ExecutionPhase = "archiving"
+		task.PhaseUpdatedAt = &now
+		task.UpdatedAt = now
+		if task.Progress < 99 {
+			task.Progress = 99
+		}
+		if err := s.repo.Update(task); err != nil {
+			return fmt.Errorf("persist archive phase: %w", err)
+		}
+	}
+	if err := s.stageCOSArchive(task, metadata); err != nil {
+		return err
+	}
+	now := time.Now()
+	task.CVMArchiveStagedAt = &now
+	task.ExecutionPhase = "archiving"
+	if task.Progress < 99 {
+		task.Progress = 99
+	}
+	task.PhaseUpdatedAt = &now
+	task.UpdatedAt = now
+	return s.repo.Update(task)
+}
+
+func (s *TaskService) notifyCVMArchiveCompletion(task *model.Task) {
+	if !cvmArchiveTerminationPending(task) {
+		return
+	}
+	if err := s.emitTaskEventWithError(model.OverlayTaskEventArchiveCompleted, model.OverlayActor{}, task, model.TaskStatusCompleted, "COS archive staged"); err != nil {
+		fmt.Printf("WARNING: notify CVM archive completion for task %s: %v\n", task.UUID, err)
+		return
+	}
+	now := time.Now()
+	task.CVMArchiveTerminationNotifiedAt = &now
+	task.UpdatedAt = now
+	if err := s.repo.Update(task); err != nil {
+		// The event is idempotent for its attempt. Leave the timestamp unset so
+		// the next sync retransmits it rather than leaking the spot instance.
+		task.CVMArchiveTerminationNotifiedAt = nil
+		fmt.Printf("WARNING: persist CVM archive completion for task %s: %v\n", task.UUID, err)
+	}
+}
+
+func cvmArchiveTerminationPending(task *model.Task) bool {
+	return task != nil && task.Executor == model.ExecutorCVM && task.CVMArchiveStagedAt != nil && task.CVMArchiveTerminationNotifiedAt == nil && task.ExecutionAttemptID != ""
+}
+
+func sepiidaWorkflowUUID(task *model.Task) string {
+	if task == nil {
+		return ""
+	}
+	return task.UUID
+}
+func sepiidaWorkflowAgentID(task *model.Task) string {
+	if task != nil && task.Executor == model.ExecutorCVM {
+		return task.ExecutionAttemptID
+	}
+	return ""
+}
+
+// getExecutorPath returns the miniwdl executable path based on executor type
+func (s *TaskService) getExecutorPath(executor model.ExecutorType) string {
+	switch executor {
+	case model.ExecutorSlurm:
+		return s.cfg.Task.MiniWDLSlurmPath
+	case model.ExecutorLSF:
+		return s.cfg.Task.MiniWDLLSFPath
+	default:
+		return s.cfg.Task.MiniWDLPath
+	}
+}
+
+// getConfigFile returns the config file path based on executor type
+func (s *TaskService) getConfigFile(executor model.ExecutorType, customConfig string) string {
+	var cfgName string
+	switch executor {
+	case model.ExecutorSlurm:
+		cfgName = "slurm.cfg"
+	case model.ExecutorLSF:
+		cfgName = "lsf.cfg"
+	default:
+		cfgName = "local.cfg"
+	}
+
+	return filepath.Join(s.cfg.Task.TemplateDir, "conf", cfgName)
+}
+
+func validateTemplateName(name string) error {
+	if name == "" {
+		return fmt.Errorf("template is required")
+	}
+	if name != filepath.Base(name) || strings.Contains(name, `\`) || name == "." || name == ".." {
+		return fmt.Errorf("invalid template name")
+	}
+	return nil
+}
+
+func ensurePathInsideBase(base, path string) error {
+	baseAbs, err := filepath.Abs(base)
+	if err != nil {
+		return err
+	}
+	pathAbs, err := filepath.Abs(path)
+	if err != nil {
+		return err
+	}
+	rel, err := filepath.Rel(baseAbs, pathAbs)
+	if err != nil {
+		return err
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) || filepath.IsAbs(rel) {
+		return fmt.Errorf("path escapes base directory")
+	}
+	return nil
+}
+
+func resolveRegularFileInsideBase(base, path string) (string, error) {
+	pathEval, err := pathsafe.ResolveExistingWithin(base, path)
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Stat(pathEval)
+	if err != nil {
+		return "", err
+	}
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("file is not regular")
+	}
+	return pathEval, nil
+}
+
+func readTaskLogFile(base, path string) (string, error) {
+	safePath, err := resolveRegularFileInsideBase(base, path)
+	if err != nil {
+		return "", err
+	}
+	f, err := os.Open(safePath)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, maxTaskLogBytes+1))
+	if err != nil {
+		return "", err
+	}
+	if len(data) > maxTaskLogBytes {
+		return "", fmt.Errorf("log file exceeds maximum size of %d MB", maxTaskLogBytes>>20)
+	}
+	return string(data), nil
+}
+
+func actorCanUseOwnedResource(actor model.OverlayActor, ownerID uint) bool {
+	if actor.Role == string(model.SystemRoleSuperAdmin) {
+		return true
+	}
+	return actor.SharedInstance || (ownerID != 0 && ownerID == actor.UserID)
+}
+
+func (s *TaskService) resolveAnalysisPipeline(req *model.TaskCreateRequest, actor model.OverlayActor) (*model.Pipeline, error) {
+	req.PipelineID = model.CanonicalBuiltinPipelineID(req.PipelineID)
+	setGenome := func(genome string) {
+		if req.Inputs == nil {
+			req.Inputs = make(map[string]interface{})
+		}
+		req.Inputs["reference_genome"] = genome
+	}
+	switch req.PipelineID {
+	case model.BuiltinPipelineVCFHG19ID, model.BuiltinPipelineVCFHG38ID:
+		genome := "hg19"
+		if req.PipelineID == model.BuiltinPipelineVCFHG38ID {
+			genome = "hg38"
+		}
+		req.PipelineName, req.PipelineVersion, req.Template = "VCF SNP/InDel 注释_"+genome, "builtin-v1", "vcf2anno"
+		setGenome(genome)
+		return nil, nil
+	case model.BuiltinPipelineWESSingleID:
+		req.PipelineName, req.PipelineVersion, req.Template = "WES单样本分析_hg19", "builtin-v1", "single"
+		setGenome("hg19")
+		return nil, nil
+	case model.BuiltinPipelineWESFamilyID:
+		req.PipelineName, req.PipelineVersion, req.Template = "WES家系分析_hg19", "builtin-v1", "trio"
+		setGenome("hg19")
+		return nil, nil
+	case model.BuiltinPipelineWESSingleHG38ID:
+		req.PipelineName, req.PipelineVersion, req.Template = "WES单样本分析_hg38", "builtin-v1", "single"
+		setGenome("hg38")
+		return nil, nil
+	case model.BuiltinPipelineWESFamilyHG38ID:
+		req.PipelineName, req.PipelineVersion, req.Template = "WES家系分析_hg38", "builtin-v1", "trio"
+		setGenome("hg38")
+		return nil, nil
+	case "":
+		return nil, fmt.Errorf("pipelineId is required")
+	}
+
+	pipeline, err := s.pipelineRepo.FindScopedByUUID(req.PipelineID, actor)
+	if err != nil || pipeline.Status != model.PipelineStatusActive || !isAllowedPipelineBase(pipeline.BaseType) {
+		return nil, fmt.Errorf("pipeline not found: %s", req.PipelineID)
+	}
+	if err := requireAnalysisAvailable(model.PipelineTemplate(pipeline.BaseType)); err != nil {
+		return nil, err
+	}
+	req.PipelineName = pipeline.Name
+	req.PipelineVersion = pipeline.Version
+	req.Template = model.PipelineTemplate(pipeline.BaseType)
+	return pipeline, nil
+}
+
+// CreateTask creates a new task. It resolves data file paths from the linked Sample,
+// UploadJob, and Pipeline configuration, injecting them into WDL inputs.
+// If the upload job is not yet completed, the task enters waiting_for_data status.
+func (s *TaskService) CreateTask(ctx context.Context, req *model.TaskCreateRequest, actor model.OverlayActor) (*model.Task, error) {
+	executor := model.ExecutorType(s.cfg.Task.DefaultExecutor)
+	switch executor {
+	case model.ExecutorLocal, model.ExecutorSlurm, model.ExecutorLSF, model.ExecutorCVM:
+	default:
+		executor = model.ExecutorLocal
+	}
+	var selectedPipeline *model.Pipeline
+	var err error
+	// InputAssets is server-only and is used by the CNV baseline workflow. All
+	// browser-created analysis tasks must resolve one allowed pipeline ID here.
+	if len(req.InputAssets) == 0 {
+		selectedPipeline, err = s.resolveAnalysisPipeline(req, actor)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if err := validateTemplateName(req.Template); err != nil {
+		return nil, err
+	}
+	if err := requireAnalysisAvailable(req.Template); err != nil {
+		return nil, err
+	}
+	// CVM tasks execute the WDL bundle baked into the selected image. The
+	// Loligo container only needs the embedded catalog to build inputs, so it
+	// must not require a local TEMPLATE_DIR mount in SaaS mode. Local
+	// executors still validate their filesystem-backed workflow bundle here.
+	if executor != model.ExecutorCVM {
+		templatePath := filepath.Join(s.cfg.Task.TemplateDir, req.Template+".wdl")
+		if err := ensurePathInsideBase(s.cfg.Task.TemplateDir, templatePath); err != nil {
+			return nil, err
+		}
+		if _, err := os.Stat(templatePath); err != nil {
+			return nil, fmt.Errorf("template not found: %s", req.Template)
+		}
+	}
+
+	workflowUUID := uuid.New().String()
+	taskID := workflowUUID[:8]
+
+	inputs := req.Inputs
+	if inputs == nil {
+		inputs = make(map[string]interface{})
+	}
+	if req.Template == "baseline_fix" {
+		inputs["CNVBaselineFix.prefix"] = taskOutputPrefix(workflowUUID)
+	}
+	if err := validateActorTaskFileInputs(s.cfg, actor, inputs); err != nil {
+		return nil, err
+	}
+
+	directAssets := make([]model.TaskDataAsset, 0, len(req.InputAssets))
+	if req.Template == "vcf2anno" {
+		if selectedPipeline != nil {
+			inputs["reference_genome"] = selectedPipeline.ReferenceGenome
+		}
+		asset, err := s.resolveVCFAsset(req, actor)
+		if err != nil {
+			return nil, err
+		}
+		inputs = map[string]interface{}{"reference_genome": inputs["reference_genome"], "VCF2Anno.vcf": asset.StorageKey}
+		if req.VCFSampleName != "" {
+			inputs["VCF2Anno.sample_name"] = req.VCFSampleName
+		}
+		directAssets = append(directAssets, model.TaskDataAsset{AssetID: asset.ID, InputRole: model.TaskAssetRoleVCF})
+	}
+	read1Inputs := make([]string, 0)
+	read2Inputs := make([]string, 0)
+	for _, inputAsset := range req.InputAssets {
+		asset, err := s.assetRepo.FindByID(inputAsset.AssetID)
+		if err != nil || asset.Status != model.FileStatusCompleted || !taskDataAssetUseAllowed(asset, actor) {
+			return nil, fmt.Errorf("data asset not found")
+		}
+		directAssets = append(directAssets, model.TaskDataAsset{AssetID: asset.ID, InputRole: inputAsset.InputRole, InputIndex: inputAsset.Index})
+		switch inputAsset.InputRole {
+		case model.TaskAssetRoleCNVRead1:
+			read1Inputs = setIndexedInput(read1Inputs, inputAsset.Index, asset.StorageKey)
+		case model.TaskAssetRoleCNVRead2:
+			read2Inputs = setIndexedInput(read2Inputs, inputAsset.Index, asset.StorageKey)
+		case model.TaskAssetRoleCNVBED:
+			inputs["CNVBaselineFix.bed"] = asset.StorageKey
+		default:
+			return nil, fmt.Errorf("unsupported task data asset role: %s", inputAsset.InputRole)
+		}
+	}
+	if len(read1Inputs) > 0 {
+		inputs["CNVBaselineFix.read_1"] = read1Inputs
+	}
+	if len(read2Inputs) > 0 {
+		inputs["CNVBaselineFix.read_2"] = read2Inputs
+	}
+
+	var sampleIDRef uint
+	sampleDataReady := false
+	var uploadJob *model.UploadJob
+	needsStaging := false
+
+	if req.Template == "trio" {
+		proband, trioAssets, err := s.prepareSampleTrio(req.SampleID, req.PedigreeID, workflowUUID, actor, inputs)
+		if err != nil {
+			return nil, err
+		}
+		req.SampleID, req.InternalID = proband.UUID, proband.InternalID
+		sampleIDRef, sampleDataReady = proband.ID, true
+		directAssets = append(directAssets, trioAssets...)
+	} else if req.SampleID != "" {
+		sample, err := s.sampleRepo.FindScopedByUUID(req.SampleID, actor)
+		if err != nil {
+			return nil, fmt.Errorf("sample not found: %s", req.SampleID)
+		}
+		sampleIDRef = sample.ID
+
+		if req.Template == "vcf2anno" {
+			sampleDataReady = true
+			req.InternalID = sample.InternalID
+		}
+		if matchedPair := sample.GetMatchedPair(); req.Template != "vcf2anno" && matchedPairComplete(matchedPair) {
+			sampleDataReady = true
+			if _, exists := inputs["fastq_r1"]; !exists && matchedPair.R1Path != "" {
+				if filepath.IsAbs(matchedPair.R1Path) {
+					if err := validateActorFileReference(s.cfg, actor, "sample r1_path", matchedPair.R1Path); err != nil {
+						return nil, err
+					}
+				} else if executor != model.ExecutorCVM {
+					needsStaging = true
+				}
+				inputs["fastq_r1"] = matchedPair.R1Path
+			}
+			if _, exists := inputs["fastq_r2"]; !exists && matchedPair.R2Path != "" {
+				if filepath.IsAbs(matchedPair.R2Path) {
+					if err := validateActorFileReference(s.cfg, actor, "sample r2_path", matchedPair.R2Path); err != nil {
+						return nil, err
+					}
+				} else if executor != model.ExecutorCVM {
+					needsStaging = true
+				}
+				inputs["fastq_r2"] = matchedPair.R2Path
+			}
+		}
+	}
+	if req.Template != "trio" && req.SampleID == "" && len(req.InputAssets) == 0 {
+		return nil, fmt.Errorf("sampleId is required for single-sample analysis")
+	}
+
+	if selectedPipeline != nil {
+		if selectedPipeline.BEDAssetID != nil {
+			bed, err := s.assetRepo.FindByID(*selectedPipeline.BEDAssetID)
+			if err != nil || !bedUsable(bed) || !taskDataAssetUseAllowed(bed, actor) {
+				return nil, fmt.Errorf("pipeline BED data asset is not available")
+			}
+			if _, exists := inputs["bed_file"]; !exists {
+				inputs["bed_file"] = bed.StorageKey
+			}
+			directAssets = append(directAssets, model.TaskDataAsset{AssetID: bed.ID, InputRole: model.TaskAssetRoleAnalysisBED, InputIndex: 0})
+		}
+		if selectedPipeline.ReferenceGenome != "" {
+			if _, exists := inputs["reference_genome"]; !exists {
+				inputs["reference_genome"] = selectedPipeline.ReferenceGenome
+			}
+		}
+		if selectedPipeline.CNVBaselineID != nil {
+			baseline, err := s.baselineRepo.FindByID(*selectedPipeline.CNVBaselineID)
+			if err != nil || strings.TrimSpace(baseline.OutputPath) == "" {
+				return nil, fmt.Errorf("pipeline CNV baseline is not available")
+			}
+			if _, exists := inputs["cnv_baseline"]; !exists {
+				inputs["cnv_baseline"] = baseline.OutputPath
+			}
+		}
+	}
+
+	if req.Template == "vcf2anno" && req.UploadJobID != "" {
+		return nil, fmt.Errorf("VCF tasks must select a VCF data asset")
+	}
+	if req.UploadJobID != "" {
+		var err error
+		uploadJob, err = s.uploadJobRepo.FindByUUID(req.UploadJobID)
+		if err != nil {
+			return nil, fmt.Errorf("upload job not found: %s", req.UploadJobID)
+		}
+		if !uploadJobUseAllowed(uploadJob, actor) {
+			return nil, fmt.Errorf("upload job not found: %s", req.UploadJobID)
+		}
+		files, _ := s.uploadFileRepo.FindByJobID(uploadJob.ID)
+		if uploadJob.Provider == model.UploadProviderS3 && executor != model.ExecutorCVM {
+			needsStaging = true
+		}
+		for _, f := range files {
+			switch f.ReadType {
+			case model.ReadTypeRead1:
+				if _, exists := inputs["fastq_r1"]; !exists {
+					inputs["fastq_r1"] = f.StorageKey
+				}
+			case model.ReadTypeRead2:
+				if _, exists := inputs["fastq_r2"]; !exists {
+					inputs["fastq_r2"] = f.StorageKey
+				}
+			case model.ReadTypeSingle:
+				if _, exists := inputs["fastq_r1"]; !exists {
+					inputs["fastq_r1"] = f.StorageKey
+				}
+			case model.ReadTypeBed:
+				if _, exists := inputs["bed_file"]; !exists {
+					inputs["bed_file"] = f.StorageKey
+				}
+			}
+		}
+	}
+
+	if req.Template == "single" || req.Template == "trio" || req.Template == "vcf2anno" {
+		inputs, err = buildCVMWDLInputs(req.Template, fmt.Sprint(inputs["reference_genome"]), inputs)
+		if err != nil {
+			return nil, err
+		}
+		prefix := "SingleWES"
+		if req.Template == "vcf2anno" {
+			prefix = "VCF2Anno"
+		}
+		if req.Template == "trio" {
+			prefix = "TrioWES"
+		}
+		inputs[prefix+".prefix"] = taskOutputPrefix(workflowUUID)
+		thresholds, configErr := NewWorkflowConfigService().Get(req.Template, fmt.Sprint(inputs["reference_genome"]))
+		if configErr != nil {
+			return nil, configErr
+		}
+		applyWorkflowThresholds(inputs, thresholds)
+		if req.Template == "trio" {
+			inputs["TrioWES.ped"] = filepath.Join(s.cfg.Task.OutputDir, workflowUUID, taskOutputPrefix(workflowUUID)+".ped")
+		}
+	} else if req.Template == "baseline_fix" {
+		inputs, err = buildCVMWDLInputs(req.Template, fmt.Sprint(inputs["reference_genome"]), inputs)
+		if err != nil {
+			return nil, err
+		}
+		inputs["CNVBaselineFix.prefix"] = taskOutputPrefix(workflowUUID)
+	}
+	if executor == model.ExecutorCVM {
+		if _, err := cvmAnalysisBEDInput(req.Template, inputs); err != nil {
+			return nil, err
+		}
+	}
+	inputJSON, err := json.Marshal(inputs)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal inputs: %w", err)
+	}
+	inputJSONStr := string(inputJSON)
+
+	outputDir := filepath.Join(s.cfg.Task.OutputDir, workflowUUID)
+	if err := ensurePathInsideBase(s.cfg.Task.OutputDir, outputDir); err != nil {
+		return nil, err
+	}
+
+	configFile := ""
+	if executor != model.ExecutorCVM {
+		configFile = s.getConfigFile(executor, "")
+	}
+
+	taskStatus := model.TaskStatusQueued
+	if (req.SampleID != "" && !sampleDataReady) || needsStaging || (uploadJob != nil && uploadJob.Status != model.UploadJobStatusCompleted) {
+		taskStatus = model.TaskStatusWaitingData
+	}
+
+	now := time.Now()
+	task := &model.Task{
+		ID:                 taskID,
+		UUID:               workflowUUID,
+		Name:               req.PipelineName,
+		SampleID:           req.SampleID,
+		PedigreeID:         req.PedigreeID,
+		InternalID:         req.InternalID,
+		UploadJobID:        req.UploadJobID,
+		Pipeline:           req.PipelineName,
+		PipelineVersion:    req.PipelineVersion,
+		Template:           req.Template,
+		Executor:           executor,
+		InputJSON:          inputJSONStr,
+		ConfigFile:         configFile,
+		OutputDir:          outputDir,
+		Status:             taskStatus,
+		Progress:           0,
+		SampleIDRef:        sampleIDRef,
+		Remark:             req.Remark,
+		CreatedBy:          actor.UserID,
+		ResultImportStatus: model.ResultImportStatusPending,
+		ExternalOrgID:      actor.OrgID,
+		TenantID:           model.TenantIDForIdentity(actor.OrgID, actor.UserID),
+		EstimatedMinutes:   s.estimateTaskMinutes(sampleIDRef, uploadJob),
+		CreatedAt:          now,
+		ExpiresAt:          researchDeadline(s.cfg, now),
+		UpdatedAt:          now,
+	}
+
+	if req.Template == "trio" {
+		task.EstimatedMinutes = trioEstimatedMinutes(inputs)
+	}
+	if req.Template == "vcf2anno" {
+		task.EstimatedMinutes = vcfAnnotationEstimatedMinutes
+	}
+	if err := s.admitTask(ctx, model.OverlayAdmissionActionCreate, actor, task); err != nil {
+		return nil, err
+	}
+
+	task.PipelineSnapshotJSON = makePipelineSnapshot(selectedPipeline, req)
+	for i := range directAssets {
+		directAssets[i].TaskUUID = task.UUID
+	}
+	if err := database.GetDB().Transaction(func(tx *gorm.DB) error {
+		if e := lockTaskAssets(tx, directAssets); e != nil {
+			return e
+		}
+		if e := freezeTaskResourceIdentities(tx, task, directAssets); e != nil {
+			return e
+		}
+		if e := tx.Create(task).Error; e != nil {
+			return e
+		}
+		if len(directAssets) > 0 {
+			return tx.Create(&directAssets).Error
+		}
+		return nil
+	}); err != nil {
+		return nil, fmt.Errorf("failed to save task resources: %w", err)
+	}
+
+	s.emitTaskEvent(model.OverlayTaskEventCreated, actor, task, "", "")
+	if task.Status == model.TaskStatusQueued && !req.DeferStart {
+		if started, startErr := s.StartTask(ctx, task.UUID, actor); startErr == nil {
+			return started, nil
+		} else if refreshed, findErr := s.repo.FindByUUID(task.UUID); findErr == nil && refreshed != nil {
+			// The task is already persisted. Return its latest state (failed for
+			// deterministic launch errors, or DISPATCHING when the cloud outcome
+			// is unknown) instead of leaving the caller with a misleading queued
+			// task and a generic 500 response.
+			if refreshed.Status == model.TaskStatusQueued {
+				refreshed.Status = model.TaskStatusFailed
+				refreshed.Error = strings.TrimSpace(startErr.Error())
+				now := time.Now()
+				refreshed.FinishedAt = &now
+				refreshed.UpdatedAt = now
+				_ = s.repo.Update(refreshed)
+				s.emitTaskEvent(model.OverlayTaskEventStartFailed, actor, refreshed, model.TaskStatusQueued, startErr.Error())
+			}
+			return refreshed, nil
+		}
+	}
+
+	return task, nil
+}
+
+func (s *TaskService) DiscardDraftTask(task *model.Task) {
+	if task == nil {
+		return
+	}
+	_ = database.GetDB().Where("task_uuid = ?", task.UUID).Delete(&model.TaskDataAsset{}).Error
+	_ = s.repo.DeleteByID(task.ID)
+}
+
+// StartTask starts a queued, waiting_for_data, or failed task.
+// Before launching, it verifies that all input data files are accessible.
+func (s *TaskService) StartTask(ctx context.Context, id string, actor model.OverlayActor) (*model.Task, error) {
+	peek, err := s.repo.FindByUUID(id)
+	if err != nil {
+		return nil, fmt.Errorf("task not found: %s", id)
+	}
+	if err := requireAnalysisAvailable(peek.Template); err != nil {
+		return nil, err
+	}
+
+	if peek.Executor == model.ExecutorCVM {
+		return s.enqueueCVM(ctx, id, actor)
+	}
+
+	task, previousStatus, err := s.claimLocalStart(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := database.GetDB().Transaction(func(tx *gorm.DB) error { return validateSavedTaskResources(tx, task) }); err != nil {
+		s.releaseLocalStart(task)
+		return nil, err
+	}
+	if err := s.stageDataFiles(task); err != nil {
+		s.releaseLocalStart(task)
+		return nil, fmt.Errorf("failed to stage data files: %w", err)
+	}
+	var dispatch *model.CVMDispatchResponse
+	var cvmRequest model.CVMDispatchRequest
+	if task.Executor == model.ExecutorCVM {
+		cvmRequest, err = s.buildCVMDispatchRequest(ctx, actor, task)
+		if err != nil {
+			s.markCVMStartFailedWithError(task, err.Error())
+			s.emitTaskEvent(model.OverlayTaskEventStartFailed, actor, task, previousStatus, err.Error())
+			return nil, err
+		}
+	}
+	if err := s.admitTask(ctx, model.OverlayAdmissionActionStart, actor, task); err != nil {
+		if task.Executor == model.ExecutorCVM {
+			s.markCVMStartFailedWithError(task, err.Error())
+			s.emitTaskEvent(model.OverlayTaskEventStartFailed, actor, task, previousStatus, err.Error())
+		} else {
+			s.releaseLocalStart(task)
+		}
+		return nil, err
+	}
+
+	if task.Executor == model.ExecutorCVM {
+		var err error
+		dispatch, err = s.overlay.DispatchCVMTask(ctx, cvmRequest)
+		if err != nil {
+			if serviceOverlayDispatchOutcomeKnown(err) {
+				s.markCVMStartFailedWithError(task, err.Error())
+				s.emitTaskEvent(model.OverlayTaskEventStartFailed, actor, task, previousStatus, err.Error())
+				return nil, err
+			}
+			// A transport error has an unknown outcome. Preserve DISPATCHING
+			// and this attempt so the asynchronous CVM callback can reconcile it.
+			// Treat the accepted control-plane state as a successful start request;
+			// returning an error here invites a user retry while Tencent may already
+			// be creating the instance.
+			s.markCVMDispatchUnknown(task, err.Error())
+			return task, nil
+		}
+	}
+	if dispatch != nil && dispatch.InstanceID == "" {
+		// Onykia accepted the attempt but is waiting for spot capacity (or is
+		// reconciling an uncertain cloud response). Keep the task queued and let
+		// the asynchronous state event transition it to running.
+		task.Status = model.TaskStatusQueued
+		task.Progress = 0
+		task.VMStatus = strings.ToUpper(strings.TrimSpace(dispatch.InstanceState))
+		if task.VMStatus == "" {
+			task.VMStatus = "DISPATCHING"
+		}
+		task.CVMDispatchNextRetryAt = dispatch.RetryAt
+		task.CVMDispatchRetryDeadlineAt = dispatch.RetryDeadlineAt
+		task.CVMDispatchRetryCount = dispatch.RetryCount
+		task.Error = "CVM dispatch is awaiting confirmation"
+		task.UpdatedAt = time.Now()
+		if err := s.repo.Update(task); err != nil {
+			return nil, err
+		}
+		s.emitTaskEvent(model.OverlayTaskEventQueued, actor, task, previousStatus, task.Error)
+		return task, nil
+	}
+
+	task.Progress = 0
+	task.Error = ""
+	now := time.Now()
+	if previousStatus == model.TaskStatusFailed || previousStatus == model.TaskStatusCancelled {
+		task.RetryStartedAt = &now
+	}
+	if task.Executor == model.ExecutorCVM {
+		// A cloud instance being provisioned is not the same as a workflow
+		// running. Sepiida/Onykia will confirm the business-running phase after
+		// node initialization and MiniWDL startup. Onykia separately bills node
+		// occupancy from cloud provisioning, including initialization.
+		task.Status = model.TaskStatusQueued
+		task.ExecutionPhase = "bootstrapping"
+		task.PhaseUpdatedAt = &now
+		task.StartedAt = nil
+	} else {
+		task.Status = model.TaskStatusRunning
+		task.ExecutionPhase = "running"
+		task.PhaseUpdatedAt = &now
+		task.StartedAt = &now
+	}
+	task.UpdatedAt = now
+	if dispatch != nil {
+		task.CVMInstanceID = dispatch.InstanceID
+		task.VMStatus = dispatch.InstanceState
+		task.CVMDispatchNextRetryAt = dispatch.RetryAt
+		task.CVMDispatchRetryDeadlineAt = dispatch.RetryDeadlineAt
+		task.CVMDispatchRetryCount = dispatch.RetryCount
+	}
+
+	if err := s.repo.Update(task); err != nil {
+		if dispatch != nil {
+			_ = s.overlay.CancelCVMTask(context.Background(), model.CVMCancelRequest{Actor: actor, TaskUUID: task.UUID, AttemptID: task.ExecutionAttemptID, Reason: "Loligo task update failed"})
+			s.markCVMStartFailed(task)
+		} else {
+			s.releaseLocalStart(task)
+		}
+		s.emitTaskEvent(model.OverlayTaskEventStartFailed, actor, task, previousStatus, err.Error())
+		return nil, err
+	}
+
+	if task.Executor == model.ExecutorCVM {
+		s.emitTaskEvent(model.OverlayTaskEventQueued, actor, task, previousStatus, "CVM node is initializing")
+	} else {
+		s.emitTaskEvent(model.OverlayTaskEventRunning, actor, task, previousStatus, "")
+	}
+	if task.Executor != model.ExecutorCVM {
+		go s.launchTask(task)
+	}
+
+	return task, nil
+}
+
+// StopTask stops a running task
+func (s *TaskService) StopTask(ctx context.Context, id string, actor model.OverlayActor) (*model.Task, error) {
+	task, err := s.repo.FindByUUID(id)
+	if err != nil {
+		return nil, fmt.Errorf("task not found: %s", id)
+	}
+
+	if task.Executor == model.ExecutorCVM {
+		request := model.CVMCancelRequest{Actor: actor, TaskUUID: task.UUID, AttemptID: task.ExecutionAttemptID, Reason: cvmTerminationReason(task, model.OverlayTaskEventCancelled)}
+		cancelled, cancelErr := s.cancelCVM(ctx, id, request)
+		if cancelErr != nil {
+			return nil, cancelErr
+		}
+		return cancelled, nil
+	}
+
+	if task.Status != model.TaskStatusRunning {
+		return nil, fmt.Errorf("task is not running")
+	}
+	s.mu.Lock()
+	if cmd, ok := s.running[id]; ok {
+		_ = cmd.Process.Kill()
+		delete(s.running, id)
+	}
+	s.mu.Unlock()
+
+	task.Status = model.TaskStatusQueued
+	task.Progress = 0
+	if task.Executor == model.ExecutorCVM {
+		task.VMStatus = "TERMINATED"
+	}
+	now := time.Now()
+	task.UpdatedAt = now
+
+	if err := s.repo.Update(task); err != nil {
+		return nil, err
+	}
+
+	s.emitTaskEvent(model.OverlayTaskEventQueued, actor, task, model.TaskStatusRunning, "")
+	return task, nil
+}
+
+// RetryTask retries a failed, cancelled, or waiting_for_data task
+func (s *TaskService) RetryTask(ctx context.Context, id string, actor model.OverlayActor) (*model.Task, error) {
+	task, err := s.repo.FindByUUID(id)
+	if err != nil {
+		return nil, fmt.Errorf("task not found: %s", id)
+	}
+	if err := requireAnalysisAvailable(task.Template); err != nil {
+		return nil, err
+	}
+
+	if task.Executor == model.ExecutorCVM {
+		return s.enqueueCVM(ctx, id, actor)
+	}
+
+	if task.Status != model.TaskStatusFailed &&
+		task.Status != model.TaskStatusCancelled &&
+		task.Status != model.TaskStatusWaitingData {
+		return nil, fmt.Errorf("task cannot be retried from status: %s", task.Status)
+	}
+
+	if task.Status == model.TaskStatusWaitingData {
+		ready, reason := s.checkDataReady(task)
+		if !ready {
+			return nil, fmt.Errorf("data still not ready: %s", reason)
+		}
+	}
+
+	if task.Executor != model.ExecutorCVM {
+		if err := s.stageDataFiles(task); err != nil {
+			return nil, fmt.Errorf("failed to stage data files: %w", err)
+		}
+	}
+
+	previousStatus := task.Status
+	if task.Executor == model.ExecutorCVM {
+		forceNew := !strings.EqualFold(strings.TrimSpace(task.VMStatus), "DISPATCHING")
+		if err := s.prepareCVMExecutionAttempt(task, forceNew); err != nil {
+			return nil, err
+		}
+	} else {
+		task.ExecutionAttemptID = uuid.New().String()
+		task.UpdatedAt = time.Now()
+		if err := s.repo.Update(task); err != nil {
+			return nil, fmt.Errorf("persist execution attempt: %w", err)
+		}
+	}
+	var dispatch *model.CVMDispatchResponse
+	var cvmRequest model.CVMDispatchRequest
+	if task.Executor == model.ExecutorCVM {
+		cvmRequest, err = s.buildCVMDispatchRequest(ctx, actor, task)
+		if err != nil {
+			s.markCVMStartFailedWithError(task, err.Error())
+			s.emitTaskEvent(model.OverlayTaskEventStartFailed, actor, task, previousStatus, err.Error())
+			return nil, err
+		}
+	}
+	if err := s.admitTask(ctx, model.OverlayAdmissionActionRetry, actor, task); err != nil {
+		if task.Executor == model.ExecutorCVM {
+			s.markCVMStartFailedWithError(task, err.Error())
+			s.emitTaskEvent(model.OverlayTaskEventStartFailed, actor, task, previousStatus, err.Error())
+		}
+		return nil, err
+	}
+
+	if task.Executor == model.ExecutorCVM {
+		var err error
+		dispatch, err = s.overlay.DispatchCVMTask(ctx, cvmRequest)
+		if err != nil {
+			if serviceOverlayDispatchOutcomeKnown(err) {
+				s.markCVMStartFailedWithError(task, err.Error())
+				s.emitTaskEvent(model.OverlayTaskEventStartFailed, actor, task, previousStatus, err.Error())
+				return nil, err
+			}
+			s.markCVMDispatchUnknown(task, err.Error())
+			return task, nil
+		}
+	}
+	if dispatch != nil && dispatch.InstanceID == "" {
+		task.Status = model.TaskStatusQueued
+		task.Progress = 0
+		task.VMStatus = strings.ToUpper(strings.TrimSpace(dispatch.InstanceState))
+		if task.VMStatus == "" {
+			task.VMStatus = "DISPATCHING"
+		}
+		task.CVMDispatchNextRetryAt = dispatch.RetryAt
+		task.CVMDispatchRetryDeadlineAt = dispatch.RetryDeadlineAt
+		task.CVMDispatchRetryCount = dispatch.RetryCount
+		task.Error = "CVM dispatch is awaiting confirmation"
+		task.UpdatedAt = time.Now()
+		if err := s.repo.Update(task); err != nil {
+			return nil, err
+		}
+		s.emitTaskEvent(model.OverlayTaskEventQueued, actor, task, previousStatus, task.Error)
+		return task, nil
+	}
+
+	task.Progress = 0
+	task.Error = ""
+	now := time.Now()
+	task.RetryStartedAt = &now
+	if task.Executor == model.ExecutorCVM {
+		task.Status = model.TaskStatusQueued
+		task.ExecutionPhase = "bootstrapping"
+		task.PhaseUpdatedAt = &now
+		task.StartedAt = nil
+	} else {
+		task.Status = model.TaskStatusRunning
+		task.StartedAt = &now
+	}
+	task.UpdatedAt = now
+	if dispatch != nil {
+		task.CVMInstanceID = dispatch.InstanceID
+		task.VMStatus = dispatch.InstanceState
+		task.CVMDispatchNextRetryAt = dispatch.RetryAt
+		task.CVMDispatchRetryDeadlineAt = dispatch.RetryDeadlineAt
+		task.CVMDispatchRetryCount = dispatch.RetryCount
+	}
+
+	if err := s.repo.Update(task); err != nil {
+		if dispatch != nil {
+			_ = s.overlay.CancelCVMTask(context.Background(), model.CVMCancelRequest{Actor: actor, TaskUUID: task.UUID, AttemptID: task.ExecutionAttemptID, Reason: "Loligo task retry update failed"})
+			s.markCVMStartFailed(task)
+		}
+		s.emitTaskEvent(model.OverlayTaskEventStartFailed, actor, task, previousStatus, err.Error())
+		return nil, err
+	}
+
+	if task.Executor == model.ExecutorCVM {
+		s.emitTaskEvent(model.OverlayTaskEventQueued, actor, task, previousStatus, "CVM node is initializing")
+	} else {
+		s.emitTaskEvent(model.OverlayTaskEventRunning, actor, task, previousStatus, "")
+	}
+	if task.Executor != model.ExecutorCVM {
+		go s.launchTask(task)
+	}
+
+	return task, nil
+}
+
+// launchTask starts miniwdl as a detached process and returns immediately.
+// Sepiida Agent monitors the filesystem and reports progress to Sepiida Server.
+// The syncLoop periodically updates Loligo DB from Sepiida Server.
+func (s *TaskService) launchTask(task *model.Task) {
+	// Write input JSON
+	inputFile := filepath.Join(s.cfg.Task.OutputDir, task.ID+"_inputs.json")
+	inputJSON := []byte(task.InputJSON)
+	var executionInputs map[string]interface{}
+	if err := json.Unmarshal(inputJSON, &executionInputs); err != nil {
+		s.updateTaskError(task, "Failed to parse workflow inputs")
+		return
+	}
+	delete(executionInputs, "reference_genome")
+	delete(executionInputs, "trio_members")
+	delete(executionInputs, "trio_input_bytes")
+	if task.Template == "trio" {
+		inputs := executionInputs
+		content, _ := inputs["TrioWES.ped_content"].(string)
+		pedPath, _ := inputs["TrioWES.ped"].(string)
+		delete(inputs, "TrioWES.ped_content")
+		if content == "" || pedPath == "" {
+			s.updateTaskError(task, "Trio PED input is missing")
+			return
+		}
+		if err := os.MkdirAll(filepath.Dir(pedPath), 0750); err != nil {
+			s.updateTaskError(task, err.Error())
+			return
+		}
+		if err := os.WriteFile(pedPath, []byte(content), 0600); err != nil {
+			s.updateTaskError(task, err.Error())
+			return
+		}
+	}
+	inputJSON, _ = json.Marshal(executionInputs)
+	if err := os.WriteFile(inputFile, inputJSON, 0600); err != nil {
+		s.updateTaskError(task, fmt.Sprintf("Failed to write input file: %v", err))
+		return
+	}
+
+	// Create log directory
+	logPath := filepath.Join(s.cfg.Task.OutputDir, task.UUID, "loligo.log")
+	if err := os.MkdirAll(filepath.Dir(logPath), 0750); err != nil {
+		_ = os.Remove(inputFile)
+		s.updateTaskError(task, fmt.Sprintf("Failed to create task log directory: %v", err))
+		return
+	}
+
+	cmd := s.miniWDLCommand(task, inputFile)
+
+	// Detach from parent process
+	cmd.SysProcAttr = &syscall.SysProcAttr{}
+
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	if err == nil {
+		cmd.Stdout = logFile
+		cmd.Stderr = logFile
+	}
+
+	// Start (non-blocking) — returns immediately
+	if err := cmd.Start(); err != nil {
+		if logFile != nil {
+			_ = logFile.Close()
+		}
+		_ = os.Remove(inputFile)
+		s.updateTaskError(task, fmt.Sprintf("Failed to start miniwdl: %v", err))
+		return
+	}
+
+	task.LogPath = logPath
+	s.repo.Update(task)
+
+	s.mu.Lock()
+	s.running[task.ID] = cmd
+	s.mu.Unlock()
+
+	// Background wait: reap the process when it exits.
+	// This is a fallback — Sepiida Agent is the authoritative status source.
+	go func() {
+		err := cmd.Wait()
+		if logFile != nil {
+			_ = logFile.Close()
+		}
+
+		_ = os.Remove(inputFile)
+
+		s.mu.Lock()
+		delete(s.running, task.ID)
+		s.mu.Unlock()
+
+		// Only update status if Sepiida hasn't already done so via sync loop.
+		// Check current DB status first.
+		current, dbErr := s.repo.FindByUUID(task.UUID)
+		if dbErr == nil && (current.Status == model.TaskStatusCompleted ||
+			current.Status == model.TaskStatusFailed ||
+			current.Status == model.TaskStatusCancelled) {
+			return // Sepiida already handled it
+		}
+
+		previousStatus := task.Status
+		finishedAt := time.Now()
+		task.ExecutionPhase = "terminal"
+		task.PhaseUpdatedAt = &finishedAt
+		if err != nil {
+			task.Status = model.TaskStatusFailed
+			task.Error = err.Error()
+		} else {
+			task.Status = model.TaskStatusCompleted
+			task.Progress = 100
+		}
+		task.FinishedAt = &finishedAt
+		task.UpdatedAt = finishedAt
+		s.repo.Update(task)
+		s.syncCNVBaselineOutput(task, "")
+		s.emitStatusEvent(task, previousStatus)
+		if task.Status == model.TaskStatusCompleted {
+			s.importTaskArchive(task)
+		}
+	}()
+}
+
+func (s *TaskService) miniWDLCommand(task *model.Task, inputFile string) *exec.Cmd {
+	return exec.Command(
+		s.getExecutorPath(task.Executor), "run",
+		filepath.Join(s.cfg.Task.TemplateDir, task.Template+".wdl"),
+		"-p", s.cfg.Task.TemplateDir,
+		"--cfg", task.ConfigFile,
+		"-i", inputFile,
+		"-d", filepath.Join(s.cfg.Task.OutputDir, task.UUID),
+	)
+}
+
+func (s *TaskService) updateTaskError(task *model.Task, errMsg string) {
+	s.mu.Lock()
+	previousStatus := task.Status
+	task.Status = model.TaskStatusFailed
+	task.Error = errMsg
+	now := time.Now()
+	if task.Executor != model.ExecutorCVM {
+		task.ExecutionPhase = "terminal"
+		task.PhaseUpdatedAt = &now
+	}
+	task.FinishedAt = &now
+	task.UpdatedAt = now
+	s.repo.Update(task)
+	s.mu.Unlock()
+	s.emitTaskEvent(model.OverlayTaskEventFailed, model.OverlayActor{}, task, previousStatus, errMsg)
+}
+
+func (s *TaskService) importTaskArchive(task *model.Task) {
+	if task == nil || task.Status != model.TaskStatusCompleted {
+		return
+	}
+	if task.ResultImportStatus == model.ResultImportStatusRunning {
+		return
+	}
+
+	if s.cfg.Task.ArchiveDir == "" {
+		return
+	}
+	archiveDir, err := taskArchiveDir(s.cfg.Task.ArchiveDir, task)
+	if err != nil {
+		return
+	}
+	if _, err := os.Stat(archiveDir); err != nil {
+		return
+	}
+	if !s.localArchiveReady(task, archiveDir) {
+		return
+	}
+	fingerprint := archiveImportFingerprint(task, archiveDir)
+	if task.ResultImportStatus == model.ResultImportStatusSuccess && task.ResultImportFingerprint == fingerprint {
+		return
+	}
+
+	if err := s.runTaskArchiveImport(task, archiveDir); err != nil {
+		fmt.Printf("WARNING: result import for task %s: %v\n", task.UUID, err)
+	}
+}
+
+func (s *TaskService) runTaskArchiveImport(task *model.Task, archiveDir string) error {
+	if task == nil {
+		return fmt.Errorf("task is required")
+	}
+	return s.runTaskArchiveImportForAttempt(task, archiveDir, task.ExecutionAttemptID, "local")
+}
+
+func (s *TaskService) runTaskArchiveImportForAttempt(task *model.Task, archiveDir, expectedAttemptID, source string) error {
+	if s.cfg.IsSaaS() {
+		ctx, done := retention.Track(context.Background(), task.UUID)
+		defer done()
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
+
+	fingerprint := archiveImportFingerprint(task, archiveDir)
+	now := time.Now()
+	attemptNumber, err := s.repo.BeginResultImportForAttempt(task, expectedAttemptID, s.cfg.Task.ArchiveDir, fingerprint, now, 15*time.Minute)
+	if err != nil {
+		return err
+	}
+	batch, err := s.startResultImportBatch(task, archiveDir, fingerprint, source, now)
+	if err != nil {
+		finishedAt := time.Now()
+		if finishErr := s.repo.FinishResultImport(task, attemptNumber, model.ResultImportStatusFailed, err.Error(), "", finishedAt); finishErr != nil {
+			fmt.Printf("WARNING: persist failed result import start for task %s: %v\n", task.UUID, finishErr)
+		}
+		return err
+	}
+	result, err := NewImporter(s.cfg).ImportFromTaskArchive(task, archiveDir, batch.ID)
+	finishedAt := time.Now()
+	var importErr error
+	if err != nil {
+		importErr = err
+		task.ResultImportStatus = model.ResultImportStatusFailed
+		task.ResultImportError = err.Error()
+	} else if result == nil || !result.Success {
+		task.ResultImportStatus = model.ResultImportStatusFailed
+		if result == nil {
+			task.ResultImportError = "result importer returned no result"
+		} else {
+			task.ResultImportError = result.Error
+		}
+		importErr = fmt.Errorf("%s", task.ResultImportError)
+	} else {
+		task.ResultImportStatus = model.ResultImportStatusSuccess
+		task.ResultImportError = ""
+		task.ResultImportFingerprint = fingerprint
+		if task.Executor == model.ExecutorCVM {
+			if publishErr := s.publishCVMFinalManifest(task, finishedAt); publishErr != nil {
+				task.ResultImportStatus = model.ResultImportStatusFailed
+				task.ResultImportError = publishErr.Error()
+				task.ResultImportFingerprint = ""
+				importErr = publishErr
+			}
+		}
+	}
+	if finishErr := s.repo.FinishResultImport(task, attemptNumber, task.ResultImportStatus, task.ResultImportError, task.ResultImportFingerprint, finishedAt); finishErr != nil {
+		fmt.Printf("WARNING: persist result import state for task %s: %v\n", task.UUID, finishErr)
+		batch.Error = finishErr.Error()
+		batch.Status = model.ResultImportBatchStatusFailed
+		s.finishResultImportBatch(batch, result, model.ResultImportStatusFailed, finishErr.Error(), finishedAt)
+		return finishErr
+	}
+	if batchErr := s.finishResultImportBatch(batch, result, task.ResultImportStatus, task.ResultImportError, finishedAt); batchErr != nil {
+		if importErr != nil {
+			return errors.Join(importErr, batchErr)
+		}
+		return batchErr
+	}
+	return importErr
+}
+
+func (s *TaskService) startResultImportBatch(task *model.Task, archiveDir, fingerprint, source string, startedAt time.Time) (*model.ResultImportBatch, error) {
+	if task == nil || s.importBatchRepo == nil {
+		return nil, fmt.Errorf("result import audit repository is unavailable")
+	}
+	archivePrefix, err := filepath.Rel(s.cfg.Task.ArchiveDir, archiveDir)
+	if err != nil {
+		return nil, fmt.Errorf("resolve result import archive prefix: %w", err)
+	}
+	attemptID := task.ExecutionAttemptID
+	if attemptID == "" {
+		attemptID = task.UUID
+	}
+
+	batch := &model.ResultImportBatch{
+		TaskUUID:           task.UUID,
+		TenantID:           model.TenantIDForTask(task),
+		ExecutionAttemptID: attemptID,
+		Source:             source,
+		Status:             model.ResultImportBatchStatusRunning,
+		Fingerprint:        fingerprint,
+		ArchiveBase:        s.cfg.Task.ArchiveDir,
+		ArchivePrefix:      filepath.ToSlash(archivePrefix),
+		OutputsKey:         "outputs.resolved.json",
+		ObjectKeysJSON:     "[]",
+		CountsJSON:         "{}",
+		StartedAt:          startedAt,
+	}
+	if err := s.importBatchRepo.Create(batch); err != nil {
+		fmt.Printf("WARNING: failed to create result import batch for task %s: %v\n", task.UUID, err)
+		return nil, err
+	}
+	return batch, nil
+}
+
+func (s *TaskService) finishResultImportBatch(batch *model.ResultImportBatch, result *ImportResult, status model.ResultImportStatus, importErr string, finishedAt time.Time) error {
+	if batch == nil || s.importBatchRepo == nil {
+		return fmt.Errorf("result import audit repository is unavailable")
+	}
+
+	batch.FinishedAt = &finishedAt
+	batch.Error = importErr
+	switch status {
+	case model.ResultImportStatusSuccess:
+		batch.Status = model.ResultImportBatchStatusSuccess
+	default:
+		batch.Status = model.ResultImportBatchStatusFailed
+	}
+	if result != nil {
+		batch.ObjectKeysJSON = marshalImportAuditJSON(result.SourceFiles)
+		batch.CountsJSON = marshalImportAuditJSON(result.Counts)
+		if batch.Error == "" {
+			batch.Error = result.Error
+		}
+	}
+	if err := s.importBatchRepo.Update(batch); err != nil {
+		return fmt.Errorf("update result import audit batch for task %s: %w", batch.TaskUUID, err)
+	}
+	return nil
+}
+
+func marshalImportAuditJSON(value interface{}) string {
+	if value == nil {
+		return "null"
+	}
+	switch typed := value.(type) {
+	case []string:
+		if typed == nil {
+			return "[]"
+		}
+	case map[string]int:
+		if typed == nil {
+			return "{}"
+		}
+	}
+	data, err := json.Marshal(value)
+	if err != nil {
+		return "null"
+	}
+	return string(data)
+}
+
+func archiveImportFingerprint(task *model.Task, archiveDir string) string {
+	if task == nil {
+		return ""
+	}
+	outputsPath := filepath.Join(archiveDir, "outputs.resolved.json")
+	var outputsMod int64
+	if info, err := os.Stat(outputsPath); err == nil {
+		outputsMod = info.ModTime().UnixNano()
+	}
+	payload := fmt.Sprintf("%s|%s|%d", task.UUID, archiveDir, outputsMod)
+	sum := sha256.Sum256([]byte(payload))
+	return fmt.Sprintf("%x", sum[:])
+}
+
+func cvmFinalManifestKey(task *model.Task) (string, error) {
+	if task == nil {
+		return "", fmt.Errorf("task is required")
+	}
+	if _, err := uuid.Parse(task.ExternalOrgID); err != nil {
+		return "", fmt.Errorf("valid organization ID is required for CVM final manifest")
+	}
+	if _, err := uuid.Parse(task.UUID); err != nil {
+		return "", fmt.Errorf("valid task UUID is required for CVM final manifest")
+	}
+	if _, err := uuid.Parse(task.ExecutionAttemptID); err != nil {
+		return "", fmt.Errorf("valid execution attempt ID is required for CVM final manifest")
+	}
+	return path.Join("organizations", task.ExternalOrgID, "workflows", task.UUID, "final.json"), nil
+}
+
+func (s *TaskService) publishCVMFinalManifest(task *model.Task, finalizedAt time.Time) error {
+	key, err := cvmFinalManifestKey(task)
+	if err != nil {
+		return err
+	}
+	manifest, err := json.Marshal(map[string]interface{}{
+		"layout_version": 1,
+		"task_uuid":      task.UUID,
+		"attempt_id":     task.ExecutionAttemptID,
+		"archive_prefix": path.Join("organizations", task.ExternalOrgID, "workflows", task.UUID, "attempts", task.ExecutionAttemptID),
+		"finalized_at":   finalizedAt.UTC().Format(time.RFC3339Nano),
+	})
+	if err != nil {
+		return fmt.Errorf("encode CVM final manifest: %w", err)
+	}
+	storage, err := newS3Storage(context.Background(), s.cfg.Storage)
+	if err != nil {
+		return err
+	}
+	if err := storage.put(context.Background(), key, "application/json", append(manifest, '\n')); err != nil {
+		return fmt.Errorf("publish CVM final manifest: %w", err)
+	}
+	return nil
+}
+
+// RetryResultImport resets structured result import state and runs the archive import again.
+func (s *TaskService) RetryResultImport(ctx context.Context, id string) (*model.TaskProgressResponse, error) {
+	task, err := s.repo.FindByUUID(id)
+	if err != nil {
+		return nil, fmt.Errorf("task not found: %s", id)
+	}
+	if task.Status != model.TaskStatusCompleted {
+		return nil, fmt.Errorf("task is not completed")
+	}
+	if s.cfg.Task.ArchiveDir == "" {
+		return nil, fmt.Errorf("archive directory is not configured")
+	}
+	archiveDir, err := taskArchiveDir(s.cfg.Task.ArchiveDir, task)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := os.Stat(archiveDir); err != nil {
+		return nil, fmt.Errorf("archive not found for task: %s", id)
+	}
+	if !s.localArchiveReady(task, archiveDir) {
+		return nil, fmt.Errorf("result archive is not ready; wait for archiving to complete")
+	}
+
+	if err := s.runTaskArchiveImport(task, archiveDir); err != nil {
+		return nil, err
+	}
+	return s.GetTaskProgress(ctx, id)
+}
+
+// GetTask retrieves a task by UUID
+func (s *TaskService) GetTask(ctx context.Context, id string) (*model.Task, error) {
+	return s.repo.FindByUUID(id)
+}
+
+// GetTaskProgress retrieves task with Sepiida progress
+func (s *TaskService) GetTaskProgress(ctx context.Context, id string) (*model.TaskProgressResponse, error) {
+	task, err := s.repo.FindByUUID(id)
+	if err != nil {
+		return nil, fmt.Errorf("task not found: %s", id)
+	}
+
+	resp := &model.TaskProgressResponse{
+		ExecutionPhase: task.ExecutionPhase, ExecutionReasonCode: task.ExecutionReasonCode, AttemptID: task.ExecutionAttemptID, PhaseUpdatedAt: task.PhaseUpdatedAt,
+		BootstrapPhase: task.BootstrapPhase, BootstrapLastHeartbeatAt: task.BootstrapLastHeartbeatAt,
+		DiagnosticHoldUntil: task.DiagnosticHoldUntil, DiagnosticSummary: task.DiagnosticSummary,
+		ID:                      task.UUID,
+		UUID:                    task.UUID,
+		Name:                    task.Name,
+		Template:                task.Template,
+		Status:                  task.Status,
+		Progress:                task.Progress,
+		ExecutionAttemptID:      task.ExecutionAttemptID,
+		VMStatus:                task.VMStatus,
+		DispatchNextRetryAt:     task.CVMDispatchNextRetryAt,
+		DispatchRetryDeadlineAt: task.CVMDispatchRetryDeadlineAt,
+		DispatchRetryCount:      task.CVMDispatchRetryCount,
+		CreatedAt:               task.CreatedAt,
+		ExpiresAt:               task.ExpiresAt,
+		ResultImportStatus:      task.ResultImportStatus,
+		ResultImportError:       task.ResultImportError,
+		ResultImportedAt:        task.ResultImportedAt,
+		ResultImportFingerprint: task.ResultImportFingerprint,
+		ResultImportAttempts:    task.ResultImportAttempts,
+	}
+	if task.Executor == model.ExecutorCVM {
+		resp.NodeLiveness = nodeLiveness(task.BootstrapLastHeartbeatAt, time.Now().UTC())
+		if task.Status == model.TaskStatusRunning || task.Status == model.TaskStatusCompleted || task.Progress > 0 {
+			analysis := workflow.CalculateAnalysisProgress(task.Template, nil, task.Status == model.TaskStatusCompleted)
+			if analysis.Percent < task.Progress {
+				analysis.Percent = task.Progress
+			}
+			resp.AnalysisProgress = analysis
+		}
+		if task.ExecutionAttemptID != "" {
+			if s.sepiida == nil {
+				resp.AgentLiveness = &model.AgentLiveness{State: "legacy/unknown"}
+			} else if session, statusErr := s.sepiida.GetAgentStatus(task.UUID, task.ExecutionAttemptID); statusErr == nil && session != nil {
+				resp.AgentLiveness = agentLiveness(session, time.Now().UTC())
+			} else if errors.Is(statusErr, sepiida.ErrNotFound) {
+				resp.AgentLiveness = &model.AgentLiveness{State: "legacy/unknown"}
+			} else if statusErr == nil {
+				resp.AgentLiveness = &model.AgentLiveness{State: "legacy/unknown"}
+			} else {
+				resp.AgentLiveness = &model.AgentLiveness{State: "unknown"}
+			}
+		}
+	}
+
+	// Query Sepiida for real-time progress
+	if s.sepiida != nil && task.UUID != "" {
+		sepiidaWorkflow, tasks, err := s.sepiida.GetWorkflowWithTasks(task.UUID, sepiidaWorkflowAgentID(task))
+		resp.SepiidaQueryUnavailable = err != nil && (sepiidaWorkflow != nil || !errors.Is(err, sepiida.ErrNotFound))
+		if err == nil && sepiidaWorkflow != nil && s.currentWorkflowReport(task, sepiidaWorkflow) {
+			resp.Sepiida = sepiidaWorkflow
+			resp.Tasks = tasks
+			s.syncTaskFromSepiida(task)
+			resp.Status = task.Status
+			resp.Progress = task.Progress
+			resp.ResultImportStatus = task.ResultImportStatus
+			resp.ResultImportError = task.ResultImportError
+			resp.ResultImportedAt = task.ResultImportedAt
+			resp.ResultImportFingerprint = task.ResultImportFingerprint
+			resp.ResultImportAttempts = task.ResultImportAttempts
+			resp.ExecutionPhase = task.ExecutionPhase
+			resp.ExecutionReasonCode = task.ExecutionReasonCode
+			resp.AttemptID = task.ExecutionAttemptID
+			resp.PhaseUpdatedAt = task.PhaseUpdatedAt
+			resp.BootstrapPhase = task.BootstrapPhase
+			resp.BootstrapLastHeartbeatAt = task.BootstrapLastHeartbeatAt
+			resp.DiagnosticHoldUntil = task.DiagnosticHoldUntil
+			resp.DiagnosticSummary = task.DiagnosticSummary
+			resp.VMStatus = task.VMStatus
+			resp.DispatchNextRetryAt = task.CVMDispatchNextRetryAt
+			resp.DispatchRetryDeadlineAt = task.CVMDispatchRetryDeadlineAt
+			resp.DispatchRetryCount = task.CVMDispatchRetryCount
+			if task.Executor == model.ExecutorCVM {
+				analysis := workflow.CalculateAnalysisProgress(task.Template, tasks, sepiidaWorkflow.Status == model.SepiidaStatusSuccess)
+				if task.ExecutionPhase == "archiving" && analysis.Percent < 99 {
+					analysis.Percent = 99
+				}
+				if task.Status == model.TaskStatusCompleted {
+					analysis.Percent = 100
+				}
+				if analysis.Percent < task.Progress {
+					analysis.Percent = task.Progress
+				}
+				resp.AnalysisProgress = analysis
+				resp.NodeLiveness = nodeLiveness(task.BootstrapLastHeartbeatAt, time.Now().UTC())
+			}
+		}
+	}
+
+	return resp, nil
+}
+
+func nodeLiveness(lastSeen *time.Time, now time.Time) *model.Liveness {
+	status := &model.Liveness{State: "unknown", LastSeenAt: lastSeen}
+	if lastSeen == nil {
+		return status
+	}
+	age := now.Sub(*lastSeen)
+	switch {
+	case age <= 2*time.Minute:
+		status.State = "online"
+	case age <= 5*time.Minute:
+		status.State = "delayed"
+	default:
+		status.State = "offline"
+	}
+	return status
+}
+
+func agentLiveness(session *model.SepiidaAgentSession, now time.Time) *model.AgentLiveness {
+	result := &model.AgentLiveness{
+		LastCollectedAt: session.LastCollectedAt, LastProgressPushAt: session.LastProgressPushAt,
+		CollectionStatus: session.LastCollectionStatus, ErrorCode: session.LastErrorCode,
+	}
+	if session.LastCollectedAt == nil {
+		result.State = "legacy/unknown"
+		return result
+	}
+	interval := time.Duration(session.CollectionIntervalSeconds) * time.Second
+	onlineThreshold := 45 * time.Second
+	if interval*3 > onlineThreshold {
+		onlineThreshold = interval * 3
+	}
+	delayedThreshold := 2 * time.Minute
+	if interval*8 > delayedThreshold {
+		delayedThreshold = interval * 8
+	}
+	age := now.Sub(*session.LastCollectedAt)
+	switch {
+	case age <= onlineThreshold:
+		result.State = "online"
+	case age <= delayedThreshold:
+		result.State = "delayed"
+	default:
+		result.State = "offline"
+	}
+	return result
+}
+
+// ListTasks lists tasks with optional filtering
+func (s *TaskService) ListTasks(ctx context.Context, query *model.TaskListQuery) (*model.TaskListResponse, error) {
+	tasks, total, err := s.repo.PaginateByQuery(query)
+	if err != nil {
+		return nil, err
+	}
+
+	items := make([]model.TaskResponse, len(tasks))
+	for i, task := range tasks {
+		items[i] = task.ToResponse()
+	}
+
+	return &model.TaskListResponse{
+		Total: total,
+		Items: items,
+	}, nil
+}
+
+// ListTasksAudit lists tasks with the enriched audit response shape (for
+// cross-org monitoring consumers like Rossia). Reuses PaginateByQuery,
+// which now honors Search/CreatedSince/UpdatedSince filters.
+func (s *TaskService) ListTasksAudit(ctx context.Context, query *model.TaskListQuery) (*model.TaskAuditListResponse, error) {
+	tasks, total, err := s.repo.PaginateByQuery(query)
+	if err != nil {
+		return nil, err
+	}
+
+	items := make([]model.TaskAuditResponse, len(tasks))
+	for i, task := range tasks {
+		items[i] = task.ToAuditResponse()
+	}
+
+	return &model.TaskAuditListResponse{
+		Total: total,
+		Items: items,
+	}, nil
+}
+
+// DeleteTask removes a task from normal queries. Active CVM tasks retain a
+// durable delete intent and are hidden automatically after Onykia confirms that
+// their cloud resource has reached a terminal state.
+func (s *TaskService) DeleteTask(ctx context.Context, id string, actor model.OverlayActor) error {
+	task, err := s.repo.FindByUUID(id)
+	if err != nil {
+		return fmt.Errorf("task not found: %s", id)
+	}
+
+	if task.Executor == model.ExecutorCVM && task.ExecutionAttemptID != "" && task.ExecutionPhase != "terminal" {
+		// Deleting an active CVM is asynchronous. Persist the user's intent so
+		// the terminal Onykia callback can hide the task automatically after the
+		// cloud resource is confirmed gone.
+		now := time.Now().UTC()
+		if err := database.GetDB().WithContext(ctx).Model(&model.Task{}).
+			Where("id = ? AND delete_requested_at IS NULL", task.ID).
+			Update("delete_requested_at", now).Error; err != nil {
+			return err
+		}
+		task.DeleteRequestedAt = &now
+		request := model.CVMCancelRequest{Actor: actor, TaskUUID: task.UUID, AttemptID: task.ExecutionAttemptID, Reason: cvmTerminationReason(task, model.OverlayTaskEventCancelled)}
+		_, err := s.cancelCVM(ctx, id, request)
+		if err != nil {
+			return err
+		}
+		return nil
+	}
+	if task.Status == model.TaskStatusRunning || task.Status == model.TaskStatusQueued || task.Status == model.TaskStatusWaitingData || task.Status == model.TaskStatusCancelled {
+		s.mu.Lock()
+		if cmd, ok := s.running[id]; ok {
+			_ = cmd.Process.Kill()
+			delete(s.running, id)
+		}
+		s.mu.Unlock()
+
+		previousStatus := task.Status
+		task.Status = model.TaskStatusCancelled
+		now := time.Now()
+		if task.FinishedAt == nil {
+			task.FinishedAt = &now
+		}
+		task.UpdatedAt = now
+
+		if err := s.repo.Update(task); err != nil {
+			return err
+		}
+		if taskCancellationNeedsOverlay(task) && strings.TrimSpace(task.ExecutionAttemptID) != "" {
+			if err := s.emitTaskEventWithError(model.OverlayTaskEventCancelled, actor, task, previousStatus, "task deleted by user"); err != nil {
+				return fmt.Errorf("task cancellation settlement failed: %w", err)
+			}
+		}
+	}
+
+	return s.repo.DeleteByID(task.ID)
+}
+
+func taskDataAssetUseAllowed(asset *model.DataAsset, actor model.OverlayActor) bool {
+	if asset == nil {
+		return false
+	}
+	if actor.OrgID != "" {
+		return asset.ExternalOrgID == actor.OrgID
+	}
+	if actor.SharedInstance {
+		return asset.ExternalOrgID == ""
+	}
+	if actor.Role == string(model.SystemRoleSuperAdmin) {
+		return true
+	}
+	return asset.ExternalOrgID == "" && asset.CreatedBy == actor.UserID
+}
+
+func taskCancellationNeedsOverlay(task *model.Task) bool {
+	return task != nil && task.Executor == model.ExecutorCVM
+}
+
+// UpdateTask updates task fields
+var ErrTaskNotEditable = errors.New("仅失败或待启动的任务允许编辑")
+
+func validateTaskEditState(task *model.Task) error {
+	if task.InterpretationCompletedAt != nil {
+		return ErrInterpretationCompleted
+	}
+	if task.Status != model.TaskStatusFailed && task.Status != model.TaskStatusQueued {
+		return ErrTaskNotEditable
+	}
+	if task.Executor == model.ExecutorCVM && task.ExecutionPhase != "" && task.ExecutionPhase != "idle" && task.ExecutionPhase != "terminal" {
+		return ErrTaskNotEditable
+	}
+	return nil
+}
+
+func (s *TaskService) UpdateTask(ctx context.Context, id string, req *model.TaskUpdateRequest) (*model.Task, error) {
+	if req == nil {
+		return nil, fmt.Errorf("task update is required")
+	}
+	var task model.Task
+	err := database.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("uuid=?", id).First(&task).Error; err != nil {
+			return fmt.Errorf("task not found: %s", id)
+		}
+		if err := validateTaskEditState(&task); err != nil {
+			return err
+		}
+		changes := map[string]interface{}{"updated_at": time.Now(), "version": task.Version + 1}
+		if req.InternalID != "" {
+			task.InternalID = req.InternalID
+			changes["internal_id"] = req.InternalID
+		}
+		if req.Pipeline != "" {
+			task.Pipeline = req.Pipeline
+			changes["pipeline"] = req.Pipeline
+		}
+		if req.Remark != "" {
+			task.Remark = req.Remark
+			changes["remark"] = req.Remark
+		}
+		task.UpdatedAt = changes["updated_at"].(time.Time)
+		task.Version++
+		// The locked current state and a field-only update prevent stale edit forms
+		// from overwriting execution state when start/finish races with editing.
+		return tx.Model(&task).Updates(changes).Error
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &task, nil
+}
+
+// GetTaskLogs retrieves task logs
+func (s *TaskService) GetTaskLogs(ctx context.Context, id string) (string, error) {
+	task, err := s.repo.FindByUUID(id)
+	if err != nil {
+		return "", fmt.Errorf("task not found: %s", id)
+	}
+
+	taskOutputDir := filepath.Join(s.cfg.Task.OutputDir, task.UUID)
+	if task.LogPath != "" {
+		if logs, err := readTaskLogFile(taskOutputDir, task.LogPath); err == nil {
+			return logs, nil
+		}
+	}
+
+	if task.UUID != "" {
+		lastLink := filepath.Join(s.cfg.Task.OutputDir, task.UUID, "_LAST")
+		if target, err := os.Readlink(lastLink); err == nil {
+			lastDir := filepath.Join(taskOutputDir, target)
+			workflowLog := filepath.Join(lastDir, "workflow.log")
+			if logs, err := readTaskLogFile(taskOutputDir, workflowLog); err == nil {
+				return logs, nil
+			} else if strings.Contains(err.Error(), "escapes base directory") || strings.Contains(err.Error(), "not regular") {
+				return "", fmt.Errorf("invalid log symlink target")
+			}
+		}
+	}
+
+	return "", fmt.Errorf("no log file available")
+}
+
+// StartDataWaitSync starts a background goroutine that periodically checks tasks
+// in waiting_for_data status. When the sample has a complete effective R1/R2
+// match and the data is accessible, the task starts automatically.
+func (s *TaskService) StartDataWaitSync(ctx context.Context, interval time.Duration) {
+	go func() {
+		s.checkWaitingDataTasks()
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				s.checkWaitingDataTasks()
+			}
+		}
+	}()
+}
+
+func (s *TaskService) checkWaitingDataTasks() {
+	tasks, err := s.repo.FindByStatuses([]model.TaskStatus{model.TaskStatusWaitingData})
+	if err != nil {
+		return
+	}
+
+	for _, task := range tasks {
+		ready, _ := s.checkDataReady(&task)
+		if ready {
+			actor := model.OverlayActor{UserID: task.CreatedBy, OrgID: task.ExternalOrgID}
+			if _, startErr := s.StartTask(context.Background(), task.UUID, actor); startErr != nil {
+				task.Status = model.TaskStatusQueued
+				task.Error = "automatic start deferred: " + startErr.Error()
+				task.UpdatedAt = time.Now()
+				_ = s.repo.Update(&task)
+			}
+		}
+	}
+}
+
+func (s *TaskService) checkDataReady(task *model.Task) (ready bool, reason string) {
+	var inputs map[string]interface{}
+	if task.InputJSON != "" {
+		if err := json.Unmarshal([]byte(task.InputJSON), &inputs); err != nil {
+			return false, "failed to parse input JSON"
+		}
+	}
+	if inputs == nil {
+		inputs = make(map[string]interface{})
+	}
+	if task.SampleIDRef != 0 && task.Template != "vcf2anno" && task.Template != "trio" {
+		sample, err := s.sampleRepo.FindByID(task.SampleIDRef)
+		if err != nil {
+			return false, "sample not found"
+		}
+		matchedPair := sample.GetMatchedPair()
+		if !matchedPairComplete(matchedPair) {
+			return false, "sample is waiting for a complete R1/R2 match"
+		}
+		if applySampleMatchedPairToInputs(inputs, matchedPair) {
+			data, err := json.Marshal(inputs)
+			if err != nil {
+				return false, "failed to update input JSON"
+			}
+			task.InputJSON = string(data)
+			task.UpdatedAt = time.Now()
+			if err := s.repo.Update(task); err != nil {
+				return false, "failed to update task inputs"
+			}
+		}
+	}
+
+	if task.UploadJobID != "" {
+		uploadJob, err := s.uploadJobRepo.FindByUUID(task.UploadJobID)
+		if err != nil {
+			return false, "upload job not found"
+		}
+		if uploadJob.Status != model.UploadJobStatusCompleted {
+			return false, fmt.Sprintf("upload job status is %s", uploadJob.Status)
+		}
+		files, err := s.uploadFileRepo.FindByJobID(uploadJob.ID)
+		if err != nil {
+			return false, "upload files not found"
+		}
+		for _, f := range files {
+			if f.Status != model.FileStatusCompleted {
+				return false, fmt.Sprintf("upload file %s status is %s", f.UUID, f.Status)
+			}
+			if strings.TrimSpace(f.StorageKey) == "" {
+				return false, fmt.Sprintf("upload file %s has no storage path", f.UUID)
+			}
+		}
+		if applyUploadFilesToInputs(inputs, files) {
+			data, err := json.Marshal(inputs)
+			if err != nil {
+				return false, "failed to update input JSON"
+			}
+			task.InputJSON = string(data)
+			task.UpdatedAt = time.Now()
+			_ = s.repo.Update(task)
+		}
+	}
+	if task.Executor != model.ExecutorCVM {
+		if err := s.stageDataFiles(task); err != nil {
+			return false, err.Error()
+		}
+	}
+	if err := json.Unmarshal([]byte(task.InputJSON), &inputs); err != nil {
+		return false, err.Error()
+	}
+	if task.SampleIDRef != 0 && task.Template != "vcf2anno" && task.Template != "trio" {
+		if r1, ok := inputs["fastq_r1"].(string); !ok || strings.TrimSpace(r1) == "" {
+			return false, "sample R1 data is not ready"
+		}
+		if r2, ok := inputs["fastq_r2"].(string); !ok || strings.TrimSpace(r2) == "" {
+			return false, "sample R2 data is not ready"
+		}
+	}
+
+	for key, val := range inputs {
+		path, ok := val.(string)
+		if !ok || path == "" || key == "reference_genome" {
+			continue
+		}
+		if key != "VCF2Anno.vcf" && !containsAny(key, "fastq", "file", "bed", "reference") {
+			continue
+		}
+
+		if task.Executor == model.ExecutorCVM {
+			continue
+		}
+		if strings.HasPrefix(path, "cos://") || strings.HasPrefix(path, "http://") || strings.HasPrefix(path, "https://") {
+			return false, fmt.Sprintf("remote file paths are not supported in local Loligo: %s", path)
+		}
+
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			return false, fmt.Sprintf("file not found: %s", path)
+		}
+	}
+
+	return true, ""
+}
+
+func matchedPairComplete(pair *model.MatchedPair) bool {
+	return pair != nil && strings.TrimSpace(pair.R1Path) != "" && strings.TrimSpace(pair.R2Path) != ""
+}
+
+func applySampleMatchedPairToInputs(inputs map[string]interface{}, pair *model.MatchedPair) bool {
+	if inputs == nil || !matchedPairComplete(pair) {
+		return false
+	}
+	changed := false
+	for key, value := range map[string]string{"fastq_r1": pair.R1Path, "fastq_r2": pair.R2Path} {
+		if current, ok := inputs[key].(string); !ok || current != value {
+			inputs[key] = value
+			changed = true
+		}
+	}
+	return changed
+}
+
+func applyUploadFilesToInputs(inputs map[string]interface{}, files []model.UploadFile) bool {
+	changed := false
+	set := func(key, value string) {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return
+		}
+		if current, ok := inputs[key].(string); ok {
+			current = strings.TrimSpace(current)
+			if current == value {
+				return
+			}
+			if filepath.IsAbs(current) {
+				if _, err := os.Stat(current); err == nil {
+					return
+				}
+			}
+		}
+		inputs[key] = value
+		changed = true
+	}
+
+	for _, f := range files {
+		switch f.ReadType {
+		case model.ReadTypeRead1:
+			set("fastq_r1", f.StorageKey)
+		case model.ReadTypeRead2:
+			set("fastq_r2", f.StorageKey)
+		case model.ReadTypeSingle:
+			set("fastq_r1", f.StorageKey)
+		case model.ReadTypeBed:
+			set("bed_file", f.StorageKey)
+		}
+	}
+	return changed
+}
+
+func (s *TaskService) stageDataFiles(task *model.Task) error {
+	if task == nil {
+		return fmt.Errorf("task is required")
+	}
+	assets, directLinks, err := s.collectTaskAssets(task)
+	if err != nil {
+		return err
+	}
+	var remote []*model.DataAsset
+	for _, asset := range assets {
+		if asset.Provider == model.UploadProviderS3 {
+			remote = append(remote, asset)
+		}
+	}
+	sort.Slice(remote, func(i, j int) bool { return remote[i].UUID < remote[j].UUID })
+	if len(remote) == 0 {
+		return nil
+	}
+
+	inputDir := filepath.Join(task.OutputDir, "_inputs")
+	if err := ensurePathInsideBase(s.cfg.Task.OutputDir, inputDir); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(inputDir, 0750); err != nil {
+		return err
+	}
+	storage, err := newS3Storage(context.Background(), s.cfg.Storage)
+	if err != nil {
+		return err
+	}
+	var inputs map[string]interface{}
+	if task.InputJSON != "" {
+		_ = json.Unmarshal([]byte(task.InputJSON), &inputs)
+	}
+	if inputs == nil {
+		inputs = make(map[string]interface{})
+	}
+	for _, asset := range remote {
+		name := filepath.Base(strings.ReplaceAll(asset.FileName, `\`, "/"))
+		destination := filepath.Join(inputDir, asset.UUID+"-"+name)
+		if err := ensurePathInsideBase(inputDir, destination); err != nil {
+			return err
+		}
+		if info, err := os.Stat(destination); err != nil || !info.Mode().IsRegular() || info.Size() != asset.FileSize {
+			temporary := destination + ".part"
+			_ = os.Remove(temporary)
+			source, err := storage.open(context.Background(), asset.StorageKey)
+			if err != nil {
+				return fmt.Errorf("download data asset %s: %w", asset.UUID, err)
+			}
+			file, err := os.OpenFile(temporary, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
+			if err != nil {
+				source.Close()
+				return err
+			}
+			written, copyErr := io.Copy(file, source)
+			closeErr := file.Close()
+			source.Close()
+			if copyErr != nil || closeErr != nil || written != asset.FileSize {
+				_ = os.Remove(temporary)
+				if copyErr != nil {
+					return copyErr
+				}
+				if closeErr != nil {
+					return closeErr
+				}
+				return fmt.Errorf("downloaded size mismatch for data asset %s", asset.UUID)
+			}
+			if err := os.Rename(temporary, destination); err != nil {
+				_ = os.Remove(temporary)
+				return err
+			}
+		}
+		applyAssetInputPaths(inputs, asset, directLinks[asset.ID], destination)
+	}
+	encoded, err := json.Marshal(inputs)
+	if err != nil {
+		return err
+	}
+	task.InputJSON = string(encoded)
+	task.UpdatedAt = time.Now()
+	return s.repo.Update(task)
+}
+
+func (s *TaskService) collectTaskAssets(task *model.Task) (map[uint]*model.DataAsset, map[uint][]model.TaskDataAsset, error) {
+	assets := make(map[uint]*model.DataAsset)
+	directLinks := make(map[uint][]model.TaskDataAsset)
+	var taskAssets []model.TaskDataAsset
+	if err := database.GetDB().Where("task_uuid = ?", task.UUID).Order("input_role, input_index").Find(&taskAssets).Error; err != nil {
+		return nil, nil, err
+	}
+	for _, link := range taskAssets {
+		asset, err := s.assetRepo.FindByID(link.AssetID)
+		if err != nil || asset.Status != model.FileStatusCompleted {
+			return nil, nil, fmt.Errorf("data asset for task input is not ready")
+		}
+		assets[asset.ID] = asset
+		directLinks[asset.ID] = append(directLinks[asset.ID], link)
+	}
+	if task.SampleIDRef != 0 && task.Template != "vcf2anno" && task.Template != "trio" {
+		var link model.SampleDataLink
+		db := database.GetDB()
+		err := db.Where("sample_id = ? AND match_mode = ?", task.SampleIDRef, model.SampleMatchModeManual).First(&link).Error
+		if err != nil {
+			err = db.Where("sample_id = ? AND match_mode = ?", task.SampleIDRef, model.SampleMatchModeAutomatic).First(&link).Error
+		}
+		if err == nil {
+			for _, id := range []uint{link.Read1AssetID, link.Read2AssetID} {
+				if asset, err := s.assetRepo.FindByID(id); err == nil {
+					assets[id] = asset
+				}
+			}
+		}
+	}
+	if task.UploadJobID != "" {
+		if job, err := s.uploadJobRepo.FindByUUID(task.UploadJobID); err == nil {
+			if files, err := s.uploadFileRepo.FindByJobID(job.ID); err == nil {
+				for i := range files {
+					if asset, err := s.assetRepo.FindByUploadFileID(files[i].ID); err == nil {
+						assets[asset.ID] = asset
+					}
+				}
+			}
+		}
+	}
+	for _, asset := range assets {
+		if asset.Status != model.FileStatusCompleted || (asset.ReadType == model.ReadTypeBed && !bedUsable(asset)) {
+			return nil, nil, fmt.Errorf("data asset %s is not ready or BED validation has not passed", asset.UUID)
+		}
+	}
+	return assets, directLinks, nil
+}
+
+func (s *TaskService) stageCOSArchive(task *model.Task, metadata model.SepiidaArchiveMetadata) error {
+	if task == nil || s.cfg.Storage.Provider != "s3" {
+		return fmt.Errorf("COS/S3 storage is required for a CVM archive")
+	}
+	ctx := context.Background()
+	if s.cfg.IsSaaS() {
+		var done func()
+		ctx, done = retention.Track(ctx, task.UUID)
+		defer done()
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		var live model.Task
+		if err := database.DB.WithContext(ctx).Select("uuid").Where("uuid=? AND external_org_id=?", task.UUID, task.ExternalOrgID).First(&live).Error; err != nil {
+			return fmt.Errorf("task unavailable")
+		}
+	}
+	prefix, err := validatedCOSArchivePrefix(task, metadata, s.cfg.Storage)
+	if err != nil {
+		return err
+	}
+	storage, err := newS3Storage(ctx, s.cfg.Storage)
+	if err != nil {
+		return err
+	}
+	objects, err := storage.list(ctx, prefix+"/")
+	if err != nil {
+		return err
+	}
+	archiveDir, err := taskArchiveDir(s.cfg.Task.ArchiveDir, task)
+	if err != nil {
+		return err
+	}
+	if err := ensurePathInsideBase(s.cfg.Task.ArchiveDir, archiveDir); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(archiveDir, 0750); err != nil {
+		return err
+	}
+	metadataNames := map[string]bool{}
+	if task.Template == "vcf2anno" {
+		source, err := storage.open(ctx, path.Join(prefix, "outputs.resolved.json"))
+		if err != nil {
+			return err
+		}
+		raw, readErr := io.ReadAll(io.LimitReader(source, maxArchiveOutputsJSONBytes+1))
+		source.Close()
+		if readErr != nil {
+			return readErr
+		}
+		if len(raw) > maxArchiveOutputsJSONBytes {
+			return fmt.Errorf("outputs manifest exceeds size limit")
+		}
+		metadataNames, err = vcfArchiveMetadataNames(raw)
+		if err != nil {
+			return err
+		}
+	}
+	selected := 0
+	for _, object := range objects {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		name := path.Base(object.Key)
+		if name != "outputs.resolved.json" && !isStructuredResultFile(name) && !metadataNames[name] {
+			continue
+		}
+		destination := filepath.Join(archiveDir, name)
+		if err := ensurePathInsideBase(archiveDir, destination); err != nil {
+			return err
+		}
+		if info, err := os.Stat(destination); err == nil && info.Mode().IsRegular() && info.Size() == object.Size {
+			selected++
+			continue
+		}
+		source, err := storage.open(ctx, object.Key)
+		if err != nil {
+			return err
+		}
+		temporary := destination + ".part"
+		file, err := os.OpenFile(temporary, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
+		if err != nil {
+			source.Close()
+			return err
+		}
+		written, copyErr := io.Copy(file, source)
+		closeErr := file.Close()
+		source.Close()
+		if copyErr != nil || closeErr != nil || written != object.Size {
+			_ = os.Remove(temporary)
+			if copyErr != nil {
+				return copyErr
+			}
+			if closeErr != nil {
+				return closeErr
+			}
+			return fmt.Errorf("COS archive object size mismatch: %s", object.Key)
+		}
+		if err := os.Rename(temporary, destination); err != nil {
+			_ = os.Remove(temporary)
+			return err
+		}
+		selected++
+	}
+	if selected == 0 {
+		return fmt.Errorf("COS archive contains no importable result files")
+	}
+	if _, err := os.Stat(filepath.Join(archiveDir, "outputs.resolved.json")); err != nil {
+		return fmt.Errorf("COS archive is missing outputs.resolved.json")
+	}
+	if task.Template == "baseline_fix" {
+		data, err := (&Archiver{cfg: s.cfg}).readArchiveJSONFile(archiveDir, "outputs.resolved.json")
+		if err != nil {
+			return err
+		}
+		reference, err := validatedCNVBaselineArchiveOutput(string(data), prefix,
+			s.cfg.Storage.S3Bucket+".cos."+s.cfg.Storage.S3Region+".myqcloud.com", objects)
+		if err != nil {
+			return err
+		}
+		if err := s.registerArchivedCNVBaseline(task, reference); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validatedCOSArchivePrefix(task *model.Task, metadata model.SepiidaArchiveMetadata, storageCfg config.StorageConfig) (string, error) {
+	if task == nil || task.Executor != model.ExecutorCVM {
+		return "", fmt.Errorf("CVM task is required for a COS archive")
+	}
+	if _, err := uuid.Parse(task.ExternalOrgID); err != nil {
+		return "", fmt.Errorf("valid organization ID is required for a COS archive")
+	}
+	if _, err := uuid.Parse(task.UUID); err != nil {
+		return "", fmt.Errorf("valid task UUID is required for a COS archive")
+	}
+	if _, err := uuid.Parse(task.ExecutionAttemptID); err != nil {
+		return "", fmt.Errorf("valid execution attempt ID is required for a COS archive")
+	}
+	baseURL, err := url.Parse(strings.TrimSpace(metadata.ArchiveBase))
+	if err != nil || !strings.EqualFold(baseURL.Scheme, "https") || baseURL.Hostname() == "" || baseURL.User != nil || baseURL.RawQuery != "" || baseURL.Fragment != "" {
+		return "", fmt.Errorf("Sepiida returned an invalid COS archive base")
+	}
+	expectedHost := storageCfg.S3Bucket + ".cos." + storageCfg.S3Region + ".myqcloud.com"
+	if !strings.EqualFold(baseURL.Host, expectedHost) {
+		return "", fmt.Errorf("Sepiida archive bucket does not match configured COS bucket")
+	}
+	prefix := strings.Trim(baseURL.Path, "/")
+	expectedBasePrefix := path.Join("organizations", task.ExternalOrgID, "workflows", task.UUID, "attempts")
+	if prefix != expectedBasePrefix {
+		return "", fmt.Errorf("Sepiida archive prefix does not match the current tenant and task")
+	}
+	archivePrefix := strings.Trim(strings.TrimSpace(metadata.ArchivePrefix), "/")
+	if archivePrefix != task.ExecutionAttemptID {
+		return "", fmt.Errorf("Sepiida archive prefix does not match the current execution attempt")
+	}
+	expectedOutputsKey := path.Join(task.ExecutionAttemptID, "outputs.resolved.json")
+	if strings.Trim(strings.TrimSpace(metadata.OutputsResolvedKey), "/") != expectedOutputsKey {
+		return "", fmt.Errorf("Sepiida outputs manifest does not match the current execution attempt")
+	}
+	return path.Join(prefix, archivePrefix), nil
+}
+
+func taskArchiveDir(baseDir string, task *model.Task) (string, error) {
+	if task == nil || strings.TrimSpace(task.UUID) == "" {
+		return "", fmt.Errorf("task UUID is required for archive path")
+	}
+	if task.Executor != model.ExecutorCVM {
+		return filepath.Join(baseDir, task.UUID), nil
+	}
+	if _, err := uuid.Parse(task.ExecutionAttemptID); err != nil {
+		return "", fmt.Errorf("valid execution attempt ID is required for CVM archive path")
+	}
+	return filepath.Join(baseDir, task.UUID, "attempts", task.ExecutionAttemptID), nil
+}
+
+func isStructuredResultFile(name string) bool {
+	name = strings.ToLower(name)
+	if !strings.HasSuffix(name, ".txt") && !strings.HasSuffix(name, ".tsv") {
+		return false
+	}
+	return strings.Contains(name, "snv_indel") || strings.Contains(name, "snv.indel") ||
+		strings.Contains(name, "region.cnvanno") || strings.Contains(name, "gene.cnvanno") ||
+		strings.Contains(name, ".str") || strings.Contains(name, "str.txt") ||
+		strings.Contains(name, ".mei") || strings.Contains(name, "mei.txt") ||
+		strings.Contains(name, "mt_report") || strings.Contains(name, ".mt_") || strings.Contains(name, "roh")
+}
+
+func applyAssetInputPaths(inputs map[string]interface{}, asset *model.DataAsset, links []model.TaskDataAsset, value string) {
+	if len(links) > 0 {
+		for _, link := range links {
+			applyTaskAssetPath(inputs, link, value)
+		}
+		return
+	}
+	switch asset.ReadType {
+	case model.ReadTypeRead1:
+		inputs["fastq_r1"] = value
+	case model.ReadTypeRead2:
+		inputs["fastq_r2"] = value
+	case model.ReadTypeSingle:
+		inputs["fastq_r1"] = value
+	case model.ReadTypeBed:
+		inputs["bed_file"] = value
+	}
+}
+
+func (s *TaskService) buildCVMDispatchRequest(ctx context.Context, actor model.OverlayActor, task *model.Task) (model.CVMDispatchRequest, error) {
+	return s.buildCVMDispatchRequestForContract(ctx, actor, task, workflow.ContractVersion)
+}
+
+func (s *TaskService) buildCVMDispatchRequestForContract(ctx context.Context, actor model.OverlayActor, task *model.Task, contractVersion string) (model.CVMDispatchRequest, error) {
+	if err := requireAnalysisAvailable(task.Template); err != nil {
+		return model.CVMDispatchRequest{}, err
+	}
+	contractVersion = strings.TrimSpace(contractVersion)
+	if contractVersion == "" {
+		contractVersion = workflow.ContractVersion
+	}
+	if contractVersion != "germline-v1" && contractVersion != "germline-v2" {
+		return model.CVMDispatchRequest{}, fmt.Errorf("unsupported CVM workflow contract version")
+	}
+	if _, err := uuid.Parse(task.ExecutionAttemptID); err != nil {
+		return model.CVMDispatchRequest{}, fmt.Errorf("valid execution attempt ID is required for CVM dispatch")
+	}
+	assets, directLinks, err := s.collectTaskAssets(task)
+	if err != nil {
+		return model.CVMDispatchRequest{}, err
+	}
+	remote := make([]*model.DataAsset, 0, len(assets))
+	if strings.TrimSpace(task.ExternalOrgID) == "" {
+		return model.CVMDispatchRequest{}, fmt.Errorf("CVM task organization is required")
+	}
+	objectPrefix := path.Join("organizations", task.ExternalOrgID) + "/"
+	for _, asset := range assets {
+		if asset.Provider != model.UploadProviderS3 {
+			return model.CVMDispatchRequest{}, fmt.Errorf("CVM input asset %s is not stored in COS/S3", asset.UUID)
+		}
+		if strings.TrimSpace(asset.ExternalOrgID) != strings.TrimSpace(task.ExternalOrgID) {
+			return model.CVMDispatchRequest{}, fmt.Errorf("CVM input asset %s belongs to another tenant", asset.UUID)
+		}
+		storageKey := strings.TrimSpace(asset.StorageKey)
+		if storageKey == "" || strings.Contains(storageKey, "\\") || path.Clean(storageKey) != storageKey || !strings.HasPrefix(storageKey, objectPrefix) {
+			return model.CVMDispatchRequest{}, fmt.Errorf("CVM input asset %s has an invalid tenant object key", asset.UUID)
+		}
+		remote = append(remote, asset)
+	}
+	sort.Slice(remote, func(i, j int) bool { return remote[i].UUID < remote[j].UUID })
+
+	var inputs map[string]interface{}
+	if err := json.Unmarshal([]byte(task.InputJSON), &inputs); err != nil {
+		return model.CVMDispatchRequest{}, fmt.Errorf("parse CVM task inputs: %w", err)
+	}
+	referenceGenome, err := cvmReferenceGenome(inputs)
+	if err != nil {
+		return model.CVMDispatchRequest{}, err
+	}
+	referenceInputs, err := buildCVMWDLInputs(task.Template, referenceGenome, inputs)
+	if err != nil {
+		return model.CVMDispatchRequest{}, err
+	}
+	if err := s.preflightCVMReferences(ctx, referenceGenome, task.Template, referenceInputs); err != nil {
+		return model.CVMDispatchRequest{}, err
+	}
+	storage, err := newS3Storage(ctx, s.cfg.Storage)
+	if err != nil {
+		return model.CVMDispatchRequest{}, &CVMInputObjectError{ReasonCode: cvmReasonInputObjectUnavailable,
+			err: fmt.Errorf("CVM input object storage preflight is unavailable")}
+	}
+	cvmInputExpiry := s.cfg.Storage.CVMInputPresignExpiry
+	if cvmInputExpiry <= 0 {
+		// Keep the retry-window guarantee even for programmatically constructed
+		// configs that bypass config.Load (tests and embedded deployments).
+		cvmInputExpiry = time.Hour
+	}
+	downloads, err := prepareCVMInputDownloadsForContract(ctx, storage, remote, directLinks, cvmInputExpiry, contractVersion)
+	if err != nil {
+		return model.CVMDispatchRequest{}, err
+	}
+	for i, asset := range remote {
+		target := downloads[i].Target
+		inputs = replaceInputString(inputs, asset.StorageKey, target).(map[string]interface{})
+		applyAssetInputPaths(inputs, asset, directLinks[asset.ID], target)
+	}
+	inputs, err = buildCVMWDLInputs(task.Template, referenceGenome, inputs)
+	if err != nil {
+		return model.CVMDispatchRequest{}, err
+	}
+	if err := validateCVMStagedBED(task.Template, inputs, downloads); err != nil {
+		return model.CVMDispatchRequest{}, err
+	}
+	inlineFiles := make([]model.CVMInlineFile, 0, 1)
+	if task.Template == "trio" {
+		content, _ := inputs["TrioWES.ped_content"].(string)
+		if content == "" {
+			return model.CVMDispatchRequest{}, fmt.Errorf("Trio PED content is missing")
+		}
+		target := path.Join("/mnt/data/inputs", taskOutputPrefix(task.UUID)+".ped")
+		inputs["TrioWES.ped"] = target
+		delete(inputs, "TrioWES.ped_content")
+		inlineFiles = append(inlineFiles, model.CVMInlineFile{Target: target, Content: content})
+	}
+	if task.Template == "single" || task.Template == "trio" || task.Template == "vcf2anno" {
+		thresholds, configErr := NewWorkflowConfigService().Get(task.Template, referenceGenome)
+		if configErr != nil {
+			return model.CVMDispatchRequest{}, configErr
+		}
+		applyWorkflowThresholds(inputs, thresholds)
+	}
+	delete(inputs, "reference_genome")
+	encoded, err := json.Marshal(inputs)
+	if err != nil {
+		return model.CVMDispatchRequest{}, err
+	}
+	return model.CVMDispatchRequest{
+		Actor:     actor,
+		Task:      model.NewOverlayTaskSnapshot(task),
+		AttemptID: task.ExecutionAttemptID,
+		Execution: model.CVMExecutionSpec{
+			Template: task.Template, ReferenceGenome: referenceGenome,
+			WorkflowContractVersion: contractVersion,
+			Inputs:                  encoded, Downloads: downloads, InlineFiles: inlineFiles,
+		},
+		RequestedAt: time.Now(),
+	}, nil
+}
+
+func buildCVMWDLInputs(template, genome string, taskInputs map[string]interface{}) (map[string]interface{}, error) {
+	inputs, err := workflow.InputsForGenome(template, genome)
+	if err != nil {
+		return nil, err
+	}
+	// Preserve the selected genome's defaults before overlaying persisted inputs.
+	defaultBEDs := make(map[string]interface{})
+	for _, key := range []string{"SingleWES.bed", "TrioWES.bed", "CNVBaselineFix.bed"} {
+		if value, ok := inputs[key]; ok {
+			defaultBEDs[key] = value
+		}
+	}
+	for key, value := range taskInputs {
+		if _, known := inputs[key]; known {
+			inputs[key] = value
+		}
+	}
+	if template == "vcf2anno" {
+		if name, ok := taskInputs["VCF2Anno.sample_name"]; ok {
+			inputs["VCF2Anno.sample_name"] = name
+		}
+	}
+	inputs["reference_genome"] = genome
+	if content, ok := taskInputs["TrioWES.ped_content"]; ok {
+		inputs["TrioWES.ped_content"] = content
+	}
+	if template == "trio" {
+		// These are task metadata, not WDL inputs, but must survive conversion
+		// until the immutable task snapshot and admission estimate are saved.
+		for _, key := range []string{"trio_members", "trio_input_bytes"} {
+			if value, ok := taskInputs[key]; ok {
+				inputs[key] = value
+			}
+		}
+	}
+
+	switch template {
+	case "vcf2anno":
+		copyCVMInput(inputs, "VCF2Anno.vcf", taskInputs, "VCF2Anno.vcf")
+	case "single":
+		copyCVMInput(inputs, "SingleWES.read_1", taskInputs, "fastq_r1")
+		copyCVMInput(inputs, "SingleWES.read_2", taskInputs, "fastq_r2")
+		copyCVMInput(inputs, "SingleWES.bed", taskInputs, "bed_file")
+		copyCVMInput(inputs, "SingleWES.cnvkit_reference", taskInputs, "cnv_baseline")
+	case "trio":
+		copyCVMInput(inputs, "TrioWES.bed", taskInputs, "bed_file")
+	case "baseline_fix":
+		copyCVMInput(inputs, "CNVBaselineFix.bed", taskInputs, "bed_file")
+	}
+	// Older tasks persisted catalog example paths. Resolve those on retry too,
+	// while retaining explicitly selected custom BED assets.
+	for key, defaultBED := range defaultBEDs {
+		if bed, ok := inputs[key].(string); ok {
+			switch strings.TrimSpace(bed) {
+			case "/mnt/data/test/hg19_IDTv1.bed", "/mnt/data/test/hg38_IDTv1.bed":
+				inputs[key] = defaultBED
+			}
+		}
+	}
+	return inputs, nil
+}
+
+func (s *TaskService) prepareTrioInputs(pedigreeID, workflowUUID string, actor model.OverlayActor, inputs map[string]interface{}) (*model.Sample, []model.TaskDataAsset, error) {
+	pedigree, members, err := s.pedigreeRepo.FindByIDWithMembers(pedigreeID)
+	if err != nil || (actor.SharedInstance && pedigree.ExternalOrgID != "") || (!actor.SharedInstance && actor.Role != string(model.SystemRoleSuperAdmin) && pedigree.CreatedBy != actor.UserID) {
+		return nil, nil, fmt.Errorf("pedigree not found: %s", pedigreeID)
+	}
+	byID := make(map[string]model.PedigreeMember, len(members))
+	var proband *model.PedigreeMember
+	for i := range members {
+		member := members[i]
+		byID[member.ID] = member
+		if member.ID == pedigree.ProbandMemberID || member.Relation == model.RelationProband {
+			if proband != nil && proband.ID != member.ID {
+				return nil, nil, fmt.Errorf("trio pedigree must contain exactly one proband")
+			}
+			copy := member
+			proband = &copy
+		}
+	}
+	if proband == nil {
+		return nil, nil, fmt.Errorf("trio pedigree has no proband")
+	}
+	father, fatherOK := byID[proband.FatherID]
+	mother, motherOK := byID[proband.MotherID]
+	if !fatherOK || !motherOK || father.Relation != model.RelationFather || mother.Relation != model.RelationMother {
+		return nil, nil, fmt.Errorf("trio proband must reference one father and one mother")
+	}
+	ordered := []model.PedigreeMember{*proband, father, mother}
+	var samples []model.Sample
+	var statuses []string
+	for _, m := range ordered {
+		sample, err := s.sampleRepo.FindScopedByUUID(m.SampleID, actor)
+		if err != nil {
+			return nil, nil, fmt.Errorf("linked trio sample is unavailable")
+		}
+		samples = append(samples, *sample)
+		statuses = append(statuses, string(m.AffectedStatus))
+	}
+	return s.prepareTrioMembers(samples, statuses, workflowUUID, actor, inputs)
+}
+
+func taskOutputPrefix(workflowUUID string) string {
+	return workflowUUID
+}
+
+func trioPED(familyID string, members []model.PedigreeMember) string {
+	sex := func(g model.Gender) int {
+		if g == model.GenderMale {
+			return 1
+		}
+		if g == model.GenderFemale {
+			return 2
+		}
+		return 0
+	}
+	phenotype := func(a model.AffectedStatus) int {
+		if a == model.AffectedStatusAffected {
+			return 2
+		}
+		if a == model.AffectedStatusUnaffected {
+			return 1
+		}
+		return 0
+	}
+	return fmt.Sprintf("%s\tproband\tfather\tmother\t%d\t%d\n%s\tfather\t0\t0\t%d\t%d\n%s\tmother\t0\t0\t%d\t%d\n", familyID, sex(members[0].Gender), phenotype(members[0].AffectedStatus), familyID, sex(members[1].Gender), phenotype(members[1].AffectedStatus), familyID, sex(members[2].Gender), phenotype(members[2].AffectedStatus))
+}
+
+func copyCVMInput(target map[string]interface{}, targetKey string, source map[string]interface{}, sourceKey string) {
+	if value, ok := source[sourceKey]; ok {
+		target[targetKey] = value
+	}
+}
+
+func cvmReferenceGenome(inputs map[string]interface{}) (string, error) {
+	value, _ := inputs["reference_genome"].(string)
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", "hg19", "grch37":
+		return "hg19", nil
+	case "hg38", "grch38":
+		return "hg38", nil
+	default:
+		return "", fmt.Errorf("CVM reference_genome must be hg19/GRCh37 or hg38/GRCh38")
+	}
+}
+
+func (s *TaskService) prepareCVMExecutionAttempt(task *model.Task, forceNew bool) error {
+	if task == nil || task.Executor != model.ExecutorCVM {
+		return fmt.Errorf("CVM task is required")
+	}
+	previousAttemptID := task.ExecutionAttemptID
+	_, invalidAttempt := uuid.Parse(task.ExecutionAttemptID)
+	if forceNew || invalidAttempt != nil || cvmAttemptStateTerminal(task.VMStatus) {
+		task.ExecutionAttemptID = uuid.New().String()
+		task.CVMInstanceID = ""
+	}
+	if task.ExecutionAttemptID != previousAttemptID {
+		task.SepiidaFirstReportedAt = nil
+		task.SepiidaFirstReportExpectedAt = nil
+		task.BootstrapPhase = ""
+		task.BootstrapLastHeartbeatAt = nil
+		task.DiagnosticHoldUntil = nil
+		task.DiagnosticSummary = ""
+		task.ExecutionReasonCode = ""
+		task.ExecutionPhase = "dispatching"
+		now := time.Now().UTC()
+		task.PhaseUpdatedAt = &now
+	}
+	task.CVMArchiveStagedAt = nil
+	task.CVMArchiveTerminationNotifiedAt = nil
+	task.CVMDispatchNextRetryAt = nil
+	task.CVMDispatchRetryDeadlineAt = nil
+	task.CVMDispatchRetryCount = 0
+	// A retry starts a fresh lifecycle even when it reuses an in-flight
+	// DISPATCHING attempt after an uncertain transport result.
+	task.StartedAt = nil
+	task.FinishedAt = nil
+	task.VMStatus = "DISPATCHING"
+	task.UpdatedAt = time.Now()
+	if err := s.repo.Update(task); err != nil {
+		return fmt.Errorf("persist CVM execution attempt: %w", err)
+	}
+	return nil
+}
+
+func (s *TaskService) markCVMStartFailed(task *model.Task) {
+	if task == nil || task.Executor != model.ExecutorCVM {
+		return
+	}
+	task.VMStatus = "LAUNCH_FAILED"
+	task.UpdatedAt = time.Now()
+	_ = s.repo.Update(task)
+}
+
+func (s *TaskService) markCVMStartFailedWithError(task *model.Task, message string) {
+	if task == nil || task.Executor != model.ExecutorCVM {
+		return
+	}
+	task.Status = model.TaskStatusFailed
+	task.Error = strings.TrimSpace(message)
+	task.VMStatus = "LAUNCH_FAILED"
+	now := time.Now()
+	task.FinishedAt = &now
+	task.UpdatedAt = now
+	_ = s.repo.Update(task)
+}
+
+func (s *TaskService) markCVMDispatchUnknown(task *model.Task, message string) {
+	if task == nil || task.Executor != model.ExecutorCVM {
+		return
+	}
+	// Keep VMStatus=DISPATCHING and the attempt UUID intact. The request may
+	// have reached Onykia/Tencent even though Loligo did not receive a response;
+	// retrying must therefore reuse this attempt and ClientToken.
+	setCVMDispatchUnknownState(task, message, time.Now())
+	_ = s.repo.Update(task)
+}
+
+func setCVMDispatchUnknownState(task *model.Task, message string, now time.Time) {
+	task.Status = model.TaskStatusQueued
+	task.VMStatus = "DISPATCHING"
+	task.Error = "CVM dispatch is awaiting confirmation"
+	if detail := strings.TrimSpace(message); detail != "" {
+		task.Error += ": " + detail
+	}
+	task.UpdatedAt = now
+}
+
+func serviceOverlayDispatchOutcomeKnown(err error) bool {
+	return !OverlayDispatchOutcomeUnknown(err)
+}
+
+func cvmAttemptStateTerminal(state string) bool {
+	switch strings.ToUpper(strings.TrimSpace(state)) {
+	// A stopped or failed cloud state is still an existing resource until
+	// Onykia confirms asynchronous destruction.  Only these states release
+	// the execution slot and permit a new attempt.
+	case "TERMINATED", "RECLAIMED", "LAUNCH_FAILED":
+		return true
+	default:
+		return false
+	}
+}
+
+func replaceInputString(value interface{}, oldValue, newValue string) interface{} {
+	switch typed := value.(type) {
+	case map[string]interface{}:
+		for key, item := range typed {
+			typed[key] = replaceInputString(item, oldValue, newValue)
+		}
+	case []interface{}:
+		for i, item := range typed {
+			typed[i] = replaceInputString(item, oldValue, newValue)
+		}
+	case string:
+		if typed == oldValue {
+			return newValue
+		}
+	}
+	return value
+}
+
+func safeCVMInputName(name string) string {
+	name = path.Base(strings.ReplaceAll(name, `\`, "/"))
+	var clean strings.Builder
+	for _, r := range name {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '.' || r == '_' || r == '-' {
+			clean.WriteRune(r)
+		} else {
+			clean.WriteByte('_')
+		}
+	}
+	if clean.Len() == 0 || clean.String() == "." || clean.String() == ".." {
+		return "input.dat"
+	}
+	return clean.String()
+}
+
+// RefreshCVMExecution rebuilds the server-controlled CVM execution
+// specification for an existing attempt. It is called by Onykia immediately
+// before a capacity retry so every COS/S3 download URL has a fresh expiry.
+// The attempt UUID is checked against the current task to prevent a stale or
+// cross-task callback from receiving another task's inputs.
+func (s *TaskService) RefreshCVMExecution(ctx context.Context, taskUUID, attemptID, contractVersion string) (model.CVMExecutionSpec, error) {
+	if strings.TrimSpace(taskUUID) == "" || strings.TrimSpace(attemptID) == "" {
+		return model.CVMExecutionSpec{}, fmt.Errorf("task_uuid and attempt_id are required")
+	}
+	if _, err := uuid.Parse(taskUUID); err != nil {
+		return model.CVMExecutionSpec{}, fmt.Errorf("task_uuid must be a valid UUID")
+	}
+	if _, err := uuid.Parse(attemptID); err != nil {
+		return model.CVMExecutionSpec{}, fmt.Errorf("attempt_id must be a valid UUID")
+	}
+	task, err := s.repo.FindByUUID(taskUUID)
+	if err != nil || task == nil {
+		return model.CVMExecutionSpec{}, fmt.Errorf("task not found: %s", taskUUID)
+	}
+	if task.Executor != model.ExecutorCVM {
+		return model.CVMExecutionSpec{}, fmt.Errorf("task is not a CVM task")
+	}
+	if task.ExecutionAttemptID != attemptID {
+		return model.CVMExecutionSpec{}, fmt.Errorf("attempt_id does not match the current task execution attempt")
+	}
+	// A terminal task no longer has a valid reason to download inputs. Refusing
+	// refresh also lets Onykia finish cancellation/refund for an in-flight
+	// uncertain request without issuing a new cloud request.
+	switch task.Status {
+	case model.TaskStatusCompleted, model.TaskStatusCancelled, model.TaskStatusFailed:
+		return model.CVMExecutionSpec{}, fmt.Errorf("task is already terminal")
+	}
+	if task.ExecutionPhase == "terminating" || task.ExecutionPhase == "terminal" {
+		return model.CVMExecutionSpec{}, fmt.Errorf("task execution is already terminal")
+	}
+	request, err := s.buildCVMDispatchRequestForContract(ctx, model.OverlayActor{UserID: task.CreatedBy, OrgID: task.ExternalOrgID}, task, contractVersion)
+	if err != nil {
+		return model.CVMExecutionSpec{}, err
+	}
+	return request.Execution, nil
+}
+
+func (s *TaskService) HandleCVMStateEvent(event model.CVMStateEvent) error {
+	if strings.TrimSpace(event.TaskUUID) == "" || strings.TrimSpace(event.AttemptID) == "" || strings.TrimSpace(event.InstanceState) == "" {
+		return fmt.Errorf("task_uuid, attempt_id and instance_state are required")
+	}
+	if event.Version < 1 {
+		return fmt.Errorf("CVM event version is required")
+	}
+	if s.cfg.IsSaaS() {
+		var expired model.Task
+		if err := database.DB.Unscoped().Where("uuid=? AND expires_at<=?", event.TaskUUID, time.Now()).First(&expired).Error; err == nil {
+			if event.ExecutionPhase != "terminal" || !cvmAttemptStateTerminal(event.InstanceState) {
+				return fmt.Errorf("task expired")
+			}
+			if expired.Executor != model.ExecutorCVM {
+				return fmt.Errorf("task is not a CVM task")
+			}
+			if expired.CVMInstanceID != "" && event.InstanceID != "" && expired.CVMInstanceID != event.InstanceID {
+				return fmt.Errorf("CVM instance does not match task")
+			}
+			if expired.ExecutionAttemptID != event.AttemptID {
+				return nil
+			}
+			if expired.LastCVMEventVersion > event.Version {
+				return nil
+			}
+			previous := expired.Status
+			if expired.LastCVMEventVersion == event.Version {
+				return s.emitTaskEventWithError(terminalOverlayEventForCVMState(expired.Status, expired.Status), model.OverlayActor{}, &expired, previous, "research retention expired")
+			}
+			expired.Version++
+			if expired.StartedAt == nil && event.StartedAt != nil && cvmEventCarriesBusinessStart(event) {
+				expired.StartedAt = event.StartedAt
+			}
+			if event.FinishedAt != nil {
+				expired.FinishedAt = event.FinishedAt
+			}
+			if expired.Status != model.TaskStatusCompleted && expired.Status != model.TaskStatusFailed {
+				expired.Status = model.TaskStatusCancelled
+			}
+			expired.ExecutionPhase = "terminal"
+			expired.VMStatus = event.InstanceState
+			expired.LastCVMEventVersion = event.Version
+			if expired.FinishedAt == nil {
+				now := time.Now().UTC()
+				expired.FinishedAt = &now
+			}
+			if err := database.DB.Unscoped().Model(&model.Task{}).Where("id=?", expired.ID).Updates(map[string]interface{}{"status": expired.Status, "execution_phase": "terminal", "vm_status": event.InstanceState, "last_cvm_event_version": event.Version, "finished_at": expired.FinishedAt, "started_at": expired.StartedAt, "version": expired.Version}).Error; err != nil {
+				return err
+			}
+			return s.emitTaskEventWithError(terminalOverlayEventForCVMState(expired.Status, expired.Status), model.OverlayActor{}, &expired, previous, "research retention expired")
+		}
+	}
+	task, err := s.repo.FindByUUID(event.TaskUUID)
+	if err != nil {
+		// A terminal callback can be replayed after the first delivery already
+		// fulfilled a durable delete intent and soft-deleted the task. Treat that
+		// authenticated replay as acknowledged so Onykia can finish its outbox;
+		// non-terminal events for unknown tasks remain errors.
+		if errors.Is(err, gorm.ErrRecordNotFound) && (event.ExecutionPhase == "terminal" || cvmAttemptStateTerminal(event.InstanceState)) {
+			return nil
+		}
+		return fmt.Errorf("task lookup failed for CVM event: %w", err)
+	}
+	if task.Executor != model.ExecutorCVM {
+		return fmt.Errorf("task is not a CVM task")
+	}
+	if event.ExecutionPhase == "terminal" {
+		fmt.Printf("CVM terminal callback reconcile: task_uuid=%s event_attempt=%q task_attempt=%q event_version=%d last_event_version=%d event_phase=%q task_phase=%q event_status=%q task_status=%q delete_requested=%t\n",
+			event.TaskUUID, event.AttemptID, task.ExecutionAttemptID, event.Version, task.LastCVMEventVersion,
+			event.ExecutionPhase, task.ExecutionPhase, event.TaskStatus, task.Status, task.DeleteRequestedAt != nil)
+	}
+	if !cvmStateEventMatchesCurrentAttempt(task, event) {
+		return nil
+	}
+	if task.CVMInstanceID != "" && event.InstanceID != "" && task.CVMInstanceID != event.InstanceID {
+		return fmt.Errorf("CVM instance does not match task")
+	}
+	if event.Version > 0 && event.Version < task.LastCVMEventVersion {
+		// A lower-version callback is an out-of-order delivery from Onykia. It
+		// must never regress the task or emit a terminal billing event after a
+		// newer callback has already won.
+		return nil
+	}
+	if event.Version > 0 && event.Version == task.LastCVMEventVersion && !cvmTerminalEventNeedsReconciliation(task, event) {
+		// Onykia retries the same durable callback when Loligo persisted the
+		// task transition but the follow-up settlement/refund event was not
+		// acknowledged. The task version is already advanced in that case, so
+		// replay the terminal overlay event without applying the callback a
+		// second time. Returning early for the same version would leave an
+		// attempt permanently pre-deducted after a transient overlay outage.
+		if eventID := terminalOverlayEventForCVMState(event.TaskStatus, task.Status); eventID != "" {
+			if err := s.emitTaskEventWithError(eventID, model.OverlayActor{}, task, task.Status, event.Message); err != nil {
+				return err
+			}
+			if cvmTaskReadyForRequestedDelete(task) {
+				return s.repo.DeleteByID(task.ID)
+			}
+		}
+		return nil
+	}
+	if event.Version > 0 {
+		task.LastCVMEventVersion = event.Version
+	}
+	if event.ExecutionPhase == "running" && task.SepiidaFirstReportExpectedAt == nil {
+		expectedAt := event.OccurredAt.UTC()
+		if event.OccurredAt.IsZero() {
+			expectedAt = time.Now().UTC()
+		}
+		result := database.GetDB().Model(&model.Task{}).
+			Where("uuid = ? AND execution_attempt_id = ? AND sepiida_first_report_expected_at IS NULL", task.UUID, event.AttemptID).
+			Update("sepiida_first_report_expected_at", expectedAt)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 1 {
+			task.SepiidaFirstReportExpectedAt = &expectedAt
+		} else {
+			var persisted model.Task
+			if err := database.GetDB().Select("sepiida_first_report_expected_at").Where("uuid = ? AND execution_attempt_id = ?", task.UUID, event.AttemptID).First(&persisted).Error; err == nil {
+				task.SepiidaFirstReportExpectedAt = persisted.SepiidaFirstReportExpectedAt
+			}
+		}
+	}
+	if event.ExecutionPhase != "" && (task.ExecutionPhase != "terminating" || event.ExecutionPhase == "terminal" || event.ExecutionPhase == "release_failed") {
+		phaseChanged := task.ExecutionPhase != event.ExecutionPhase
+		task.ExecutionPhase = event.ExecutionPhase
+		if phaseChanged {
+			now := time.Now().UTC()
+			task.PhaseUpdatedAt = &now
+		}
+	}
+	if event.BootstrapPhase != "" {
+		task.BootstrapPhase = event.BootstrapPhase
+	}
+	if event.LastHeartbeatAt != nil {
+		task.BootstrapLastHeartbeatAt = event.LastHeartbeatAt
+	}
+	if event.DiagnosticSummary != "" {
+		task.DiagnosticSummary = event.DiagnosticSummary
+	}
+	if event.DiagnosticHoldUntil != nil || (event.ExecutionPhase != "" && event.ExecutionPhase != "diagnostic_hold") {
+		task.DiagnosticHoldUntil = event.DiagnosticHoldUntil
+	}
+	failureMessage, reasonCode := cvmFailureDiagnostic(task, event)
+	task.ExecutionReasonCode = reasonCode
+	previousStatus := task.Status
+	// Onykia may deliver a cancellation callback after the user-facing delete
+	// request already transitioned the task locally.  Keep the state update
+	// idempotent, but do not treat the same status as a reason to skip the
+	// overlay event: the first delivery may have failed while Tencent's
+	// request outcome was still unknown, and Onykia needs this callback to finish
+	// the deferred refund/runtime settlement.
+	// A late cancellation callback must never regress a workflow that Loligo
+	// has already recorded as failed. It may repeat an existing cancelled state
+	// because the first cancellation event can have been rejected while Onykia
+	// was still reconciling the cloud request, so keep that retry path enabled.
+	forceCancellationEvent := event.TaskStatus == model.TaskStatusCancelled && task.Status != model.TaskStatusCompleted && task.Status != model.TaskStatusFailed
+	if event.InstanceID != "" {
+		task.CVMInstanceID = event.InstanceID
+	}
+	// Preserve the timestamps held by Onykia's durable attempt. A cancellation
+	// can reconcile an instance after Loligo saw only a queued/DISPATCHING
+	// response; without these values the overlay would mistake an already
+	// created VM for a never-started task and refund the full pre-deduction.
+	if event.StartedAt != nil && task.StartedAt == nil && cvmEventCarriesBusinessStart(event) {
+		task.StartedAt = event.StartedAt
+	}
+	if event.FinishedAt != nil {
+		task.FinishedAt = event.FinishedAt
+	}
+	task.VMStatus = strings.ToUpper(event.InstanceState)
+	if event.RetryAt != nil {
+		task.CVMDispatchNextRetryAt = event.RetryAt
+	}
+	if event.RetryDeadlineAt != nil {
+		task.CVMDispatchRetryDeadlineAt = event.RetryDeadlineAt
+	}
+	if event.RetryCount > task.CVMDispatchRetryCount {
+		task.CVMDispatchRetryCount = event.RetryCount
+	}
+	if event.TaskStatus == model.TaskStatusQueued && strings.TrimSpace(event.Message) != "" {
+		task.Error = strings.TrimSpace(event.Message)
+	}
+	if event.ExecutionPhase == "release_failed" && strings.TrimSpace(event.Message) != "" {
+		task.Error = strings.TrimSpace(event.Message)
+	}
+	if event.TaskStatus == model.TaskStatusRunning {
+		task.CVMDispatchNextRetryAt = nil
+		task.CVMDispatchRetryDeadlineAt = nil
+		task.Error = ""
+	}
+	if event.TaskStatus == model.TaskStatusRunning && task.Status == model.TaskStatusQueued && task.ExecutionPhase != "terminating" {
+		task.Status = model.TaskStatusRunning
+		task.Error = ""
+		task.Progress = 0
+		if task.StartedAt == nil {
+			now := time.Now()
+			task.StartedAt = &now
+		}
+	}
+	if forceCancellationEvent && task.Status != model.TaskStatusCompleted {
+		if task.Status != model.TaskStatusCancelled {
+			task.Status = model.TaskStatusCancelled
+		}
+		if task.FinishedAt == nil {
+			now := time.Now()
+			task.FinishedAt = &now
+		}
+	}
+	if event.TaskStatus == model.TaskStatusFailed && task.Status != model.TaskStatusCompleted && task.Status != model.TaskStatusCancelled {
+		task.Status = model.TaskStatusFailed
+		task.Error = failureMessage
+		now := time.Now()
+		task.FinishedAt = &now
+	}
+	task.UpdatedAt = time.Now()
+	if err := s.repo.Update(task); err != nil {
+		return err
+	}
+	if forceCancellationEvent {
+		if err := s.emitTaskEventWithError(model.OverlayTaskEventCancelled, model.OverlayActor{}, task, previousStatus, event.Message); err != nil {
+			return err
+		}
+	} else {
+		s.emitStatusEvent(task, previousStatus)
+	}
+	if cvmTaskReadyForRequestedDelete(task) {
+		return s.repo.DeleteByID(task.ID)
+	}
+	return nil
+}
+
+func cvmTaskReadyForRequestedDelete(task *model.Task) bool {
+	if task == nil || task.DeleteRequestedAt == nil || task.ExecutionPhase != "terminal" {
+		return false
+	}
+	switch task.Status {
+	case model.TaskStatusCompleted, model.TaskStatusPendingInterpretation, model.TaskStatusFailed, model.TaskStatusCancelled:
+		return true
+	default:
+		return false
+	}
+}
+
+func cvmTerminalEventNeedsReconciliation(task *model.Task, event model.CVMStateEvent) bool {
+	return task != nil &&
+		event.Version > 0 &&
+		event.Version == task.LastCVMEventVersion &&
+		event.ExecutionPhase == "terminal" &&
+		task.ExecutionPhase != "terminal"
+}
+
+// terminalOverlayEventForCVMState identifies the idempotent business event
+// which must be redelivered when a Onykia callback is retried with an already
+// observed version. It deliberately refuses to regress a task that has already
+// reached a stronger terminal state.
+func terminalOverlayEventForCVMState(eventStatus, currentStatus model.TaskStatus) string {
+	switch eventStatus {
+	case model.TaskStatusCancelled:
+		if currentStatus == model.TaskStatusCompleted || currentStatus == model.TaskStatusFailed {
+			return ""
+		}
+		return model.OverlayTaskEventCancelled
+	case model.TaskStatusFailed:
+		if currentStatus == model.TaskStatusCompleted || currentStatus == model.TaskStatusCancelled {
+			return ""
+		}
+		return model.OverlayTaskEventFailed
+	case model.TaskStatusCompleted:
+		if currentStatus == model.TaskStatusCompleted {
+			return model.OverlayTaskEventCompleted
+		}
+	}
+	return ""
+}
+
+// A release acknowledgement can carry only task.failed after a concrete
+// preflight error. Preserve that diagnosis for the already-matched attempt.
+func cvmFailureDiagnostic(task *model.Task, event model.CVMStateEvent) (string, string) {
+	message, reason := strings.TrimSpace(event.Message), event.ReasonCode
+	if event.TaskStatus == model.TaskStatusFailed && task.Status == model.TaskStatusFailed &&
+		reason == "" && (message == "" || message == model.OverlayTaskEventFailed) && strings.TrimSpace(task.Error) != "" {
+		return task.Error, task.ExecutionReasonCode
+	}
+	if message == "" {
+		message = "CVM instance terminated before the workflow completed"
+	}
+	return message, reason
+}
+
+func cvmStateEventMatchesCurrentAttempt(task *model.Task, event model.CVMStateEvent) bool {
+	return task != nil && task.ExecutionAttemptID != "" && task.ExecutionAttemptID == event.AttemptID
+}
+
+func cvmEventCarriesBusinessStart(event model.CVMStateEvent) bool {
+	if event.TaskStatus == model.TaskStatusRunning {
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(event.ExecutionPhase)) {
+	case "running", "archiving":
+		return true
+	case "dispatching", "waiting_quota", "waiting_capacity", "bootstrapping", "terminating":
+		return false
+	default:
+		// Terminal callbacks from current Onykia workers carry the durable
+		// runtime timestamp while older workers may omit the phase. Preserve a
+		// non-empty timestamp in that compatibility case, but never infer one
+		// from a queued/dispatching callback.
+		return event.TaskStatus == model.TaskStatusCompleted || event.TaskStatus == model.TaskStatusFailed || event.TaskStatus == model.TaskStatusCancelled
+	}
+}
+
+func cvmTaskNeedsCancel(task *model.Task) bool {
+	return task != nil && task.Executor == model.ExecutorCVM && strings.TrimSpace(task.ExecutionAttemptID) != ""
+}
+
+func setIndexedInput(values []string, index int, value string) []string {
+	if index < 0 {
+		index = 0
+	}
+	for len(values) <= index {
+		values = append(values, "")
+	}
+	values[index] = value
+	return values
+}
+
+func applyTaskAssetPath(inputs map[string]interface{}, link model.TaskDataAsset, value string) {
+	switch link.InputRole {
+	case model.TaskAssetRoleVCF:
+		inputs["VCF2Anno.vcf"] = value
+	case model.TaskAssetRoleTrioRead1, model.TaskAssetRoleTrioRead2:
+		meta, _ := inputs["TrioWES.meta_info"].(map[string]interface{})
+		if meta == nil {
+			meta = map[string]interface{}{}
+		}
+		key := "read_1"
+		if link.InputRole == model.TaskAssetRoleTrioRead2 {
+			key = "read_2"
+		}
+		values := make([]string, 0)
+		switch current := meta[key].(type) {
+		case []string:
+			values = append(values, current...)
+		case []interface{}:
+			for _, item := range current {
+				values = append(values, fmt.Sprint(item))
+			}
+		}
+		meta[key] = setIndexedInput(values, link.InputIndex, value)
+		inputs["TrioWES.meta_info"] = meta
+	case model.TaskAssetRoleCNVRead1, model.TaskAssetRoleCNVRead2:
+		key := "CNVBaselineFix.read_1"
+		if link.InputRole == model.TaskAssetRoleCNVRead2 {
+			key = "CNVBaselineFix.read_2"
+		}
+		values := make([]string, 0)
+		switch current := inputs[key].(type) {
+		case []string:
+			values = append(values, current...)
+		case []interface{}:
+			for _, item := range current {
+				values = append(values, fmt.Sprint(item))
+			}
+		}
+		inputs[key] = setIndexedInput(values, link.InputIndex, value)
+	case model.TaskAssetRoleCNVBED:
+		inputs["CNVBaselineFix.bed"] = value
+	case model.TaskAssetRoleAnalysisBED:
+		inputs["bed_file"] = value
+	}
+}
+
+func containsAny(s string, substrs ...string) bool {
+	for _, sub := range substrs {
+		for i := 0; i < len(s); i++ {
+			end := i + len(sub)
+			if end > len(s) {
+				break
+			}
+			match := true
+			for j := 0; j < len(sub); j++ {
+				c1 := s[i+j]
+				c2 := sub[j]
+				if c1 >= 'A' && c1 <= 'Z' {
+					c1 += 32
+				}
+				if c2 >= 'A' && c2 <= 'Z' {
+					c2 += 32
+				}
+				if c1 != c2 {
+					match = false
+					break
+				}
+			}
+			if match {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func researchDeadline(cfg *config.Config, created time.Time) *time.Time {
+	if !cfg.IsSaaS() {
+		return nil
+	}
+	deadline := created.UTC().Add(720 * time.Hour)
+	return &deadline
+}

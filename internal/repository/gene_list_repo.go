@@ -1,0 +1,94 @@
+package repository
+
+import (
+	"github.com/SchemaBio/Loligo/internal/model"
+)
+
+// GeneListRepository provides gene list-specific operations
+type GeneListRepository struct {
+	*Repository[model.GeneList]
+}
+
+// NewGeneListRepository creates a new gene list repository
+func NewGeneListRepository() *GeneListRepository {
+	return &GeneListRepository{
+		Repository: NewRepository[model.GeneList](),
+	}
+}
+
+// FindScopedByStringID finds a gene list visible to the authenticated actor.
+// Gene lists are currently user-owned resources; organization-wide sharing
+// requires an explicit product/data-model decision and must not be inferred
+// merely from the actor's organization membership.
+func (r *GeneListRepository) FindScopedByStringID(id string, actor model.OverlayActor) (*model.GeneList, error) {
+	db := r.db.Where("id = ?", id)
+	if actor.SharedInstance {
+		db = db.Where("COALESCE(external_org_id, '') = ''")
+	} else if actor.OrgID != "" {
+		db = db.Where("external_org_id = ? OR (external_org_id = '' AND created_by = ?)", actor.OrgID, actor.UserID)
+	} else if actor.Role != string(model.SystemRoleSuperAdmin) {
+		if actor.UserID == 0 {
+			db = db.Where("1 = 0")
+		} else {
+			db = db.Where("external_org_id = '' AND created_by = ?", actor.UserID)
+		}
+	}
+	var geneList model.GeneList
+	if err := db.First(&geneList).Error; err != nil {
+		return nil, err
+	}
+	return &geneList, nil
+}
+
+// PaginateByQuery finds gene lists with pagination and search
+func (r *GeneListRepository) PaginateByQuery(query *model.GeneListListQuery) ([]model.GeneList, int64, error) {
+	db := r.db.Model(&model.GeneList{})
+
+	if query.SharedInstance {
+		db = db.Where("COALESCE(external_org_id, '') = ''")
+	}
+	if !query.IncludeAll {
+		if query.OrgID != "" {
+			db = db.Where("external_org_id = ? OR (external_org_id = '' AND created_by = ?)", query.OrgID, query.CreatedBy)
+		} else if query.CreatedBy != 0 {
+			db = db.Where("external_org_id = '' AND created_by = ?", query.CreatedBy)
+		} else {
+			db = db.Where("1 = 0")
+		}
+	}
+	if query.Search != "" {
+		search := "%" + query.Search + "%"
+		db = db.Where("name LIKE ? OR description LIKE ?", search, search)
+	}
+
+	var total int64
+	if err := db.Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+
+	page := query.Page
+	if page < 1 {
+		page = 1
+	}
+	pageSize := query.PageSize
+	if pageSize < 1 {
+		pageSize = 10
+	}
+
+	var lists []model.GeneList
+	offset := (page - 1) * pageSize
+	err := db.Order("created_at DESC").Offset(offset).Limit(pageSize).Find(&lists).Error
+	return lists, total, err
+}
+
+// FindByName finds a gene list by name
+func (r *GeneListRepository) FindByName(name string) (*model.GeneList, error) {
+	return r.FindOneByCondition(map[string]interface{}{"name": name})
+}
+
+// ExistsByName checks if a gene list with the given name exists
+func (r *GeneListRepository) ExistsByName(name string) bool {
+	var count int64
+	r.db.Model(&model.GeneList{}).Where("name = ?", name).Count(&count)
+	return count > 0
+}

@@ -1,0 +1,355 @@
+package repository
+
+import (
+	"errors"
+	"fmt"
+	"path"
+	"time"
+
+	"github.com/SchemaBio/Loligo/internal/model"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+)
+
+var ErrResultImportAlreadyRunning = errors.New("result import is already running")
+
+// DeleteByID publishes cache tombstones atomically with soft deletion.
+func (r *TaskRepository) DeleteByID(id string) error {
+	return r.db.Transaction(func(tx *gorm.DB) error {
+		var task model.Task
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id=?", id).First(&task).Error; err != nil {
+			return err
+		}
+		if err := model.DeleteHistoryFocuses(tx, &task); err != nil {
+			return err
+		}
+		return tx.Delete(&task).Error
+	})
+}
+
+// Update rejects stale task snapshots, including callbacks racing cancellation.
+func (r *TaskRepository) Update(task *model.Task) error {
+	return r.db.Transaction(func(tx *gorm.DB) error {
+		var current model.Task
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", task.ID).First(&current).Error; err != nil {
+			return err
+		}
+		if current.Version != task.Version {
+			return fmt.Errorf("task state changed; retry operation")
+		}
+		// Import bookkeeping is updated independently from task lifecycle state.
+		// Preserve the latest values when a stale lifecycle snapshot is saved.
+		task.ResultImportStatus = current.ResultImportStatus
+		task.ResultImportError = current.ResultImportError
+		task.ResultImportedAt = current.ResultImportedAt
+		task.ResultImportStartedAt = current.ResultImportStartedAt
+		task.ResultImportFingerprint = current.ResultImportFingerprint
+		task.ResultImportAttempts = current.ResultImportAttempts
+		task.Version++
+		if r.bamRetentionBucket != "" {
+			if err := RegisterBAMRetention(tx, &current, r.bamRetentionBucket); err != nil {
+				return err
+			}
+			if err := RegisterBAMRetention(tx, task, r.bamRetentionBucket); err != nil {
+				return err
+			}
+		}
+		return tx.Save(task).Error
+	})
+}
+
+// BeginResultImport claims a completed task attempt without changing its
+// lifecycle version. A stale running import is closed with an audit batch so
+// interrupted imports can be retried safely.
+func (r *TaskRepository) BeginResultImport(task *model.Task, archiveBase, fingerprint string, now time.Time, staleAfter time.Duration) (int, error) {
+	if task == nil {
+		return 0, fmt.Errorf("task is required")
+	}
+	return r.BeginResultImportForAttempt(task, task.ExecutionAttemptID, archiveBase, fingerprint, now, staleAfter)
+}
+
+// BeginResultImportForAttempt adds an explicit attempt fence for operator
+// recovery commands. The row lock checks the requested attempt atomically with
+// the import claim, so a retry cannot switch to a newer task execution.
+func (r *TaskRepository) BeginResultImportForAttempt(task *model.Task, expectedAttemptID, archiveBase, fingerprint string, now time.Time, staleAfter time.Duration) (int, error) {
+	if task == nil {
+		return 0, fmt.Errorf("task is required")
+	}
+	if task.ExecutionAttemptID != expectedAttemptID {
+		return 0, fmt.Errorf("execution attempt does not match the requested result import attempt")
+	}
+	attempts := 0
+	err := r.db.Transaction(func(tx *gorm.DB) error {
+		var current model.Task
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("uuid = ?", task.UUID).First(&current).Error; err != nil {
+			return err
+		}
+		if current.ExecutionAttemptID != expectedAttemptID {
+			return fmt.Errorf("execution attempt changed before result import")
+		}
+		if current.Status != model.TaskStatusCompleted {
+			return fmt.Errorf("task is not completed")
+		}
+		if current.ResultImportStatus == model.ResultImportStatusRunning {
+			if current.ResultImportStartedAt != nil && now.Sub(*current.ResultImportStartedAt) < staleAfter {
+				return ErrResultImportAlreadyRunning
+			}
+			previousStarted := current.ResultImportStartedAt
+			if previousStarted == nil {
+				previousStarted = &current.UpdatedAt
+			}
+			batchAttemptID := current.ExecutionAttemptID
+			if batchAttemptID == "" {
+				batchAttemptID = current.UUID
+			}
+			archivePrefix := current.UUID
+			if current.Executor == model.ExecutorCVM {
+				archivePrefix = path.Join(current.UUID, "attempts", batchAttemptID)
+			}
+			interrupted := &model.ResultImportBatch{
+				TaskUUID: current.UUID, TenantID: model.TenantIDForTask(&current),
+				ExecutionAttemptID: batchAttemptID, Source: "local", Status: model.ResultImportBatchStatusFailed,
+				Fingerprint: fingerprint, ArchiveBase: archiveBase, ArchivePrefix: archivePrefix,
+				OutputsKey: "outputs.resolved.json", ObjectKeysJSON: "[]", CountsJSON: "{}",
+				Error:     "previous result import did not finish; marked stale before retry",
+				StartedAt: *previousStarted, FinishedAt: &now,
+			}
+			if err := tx.Create(interrupted).Error; err != nil {
+				return fmt.Errorf("record interrupted result import: %w", err)
+			}
+		}
+
+		attempts = current.ResultImportAttempts + 1
+		if err := tx.Model(&model.Task{}).Where("uuid = ? AND execution_attempt_id = ?", current.UUID, current.ExecutionAttemptID).Updates(map[string]interface{}{
+			"result_import_status":      model.ResultImportStatusRunning,
+			"result_import_error":       "",
+			"result_imported_at":        nil,
+			"result_import_started_at":  now,
+			"result_import_fingerprint": "",
+			"result_import_attempts":    attempts,
+			"updated_at":                now,
+		}).Error; err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	task.ResultImportStatus = model.ResultImportStatusRunning
+	task.ResultImportError = ""
+	task.ResultImportedAt = nil
+	task.ResultImportStartedAt = &now
+	task.ResultImportFingerprint = ""
+	task.ResultImportAttempts = attempts
+	task.UpdatedAt = now
+	return attempts, nil
+}
+
+// FinishResultImport only writes import metadata for the still-current
+// attempt and invocation. It cannot overwrite lifecycle status or phase.
+func (r *TaskRepository) FinishResultImport(task *model.Task, attemptNumber int, status model.ResultImportStatus, importErr, fingerprint string, finishedAt time.Time) error {
+	if task == nil {
+		return fmt.Errorf("task is required")
+	}
+	updates := map[string]interface{}{
+		"result_import_status":      status,
+		"result_import_error":       importErr,
+		"result_imported_at":        nil,
+		"result_import_started_at":  nil,
+		"result_import_fingerprint": fingerprint,
+		"updated_at":                finishedAt,
+	}
+	if status == model.ResultImportStatusSuccess {
+		updates["result_imported_at"] = finishedAt
+	}
+	result := r.db.Model(&model.Task{}).Where(
+		"uuid = ? AND execution_attempt_id = ? AND result_import_status = ? AND result_import_attempts = ?",
+		task.UUID, task.ExecutionAttemptID, model.ResultImportStatusRunning, attemptNumber,
+	).Updates(updates)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return fmt.Errorf("result import attempt is no longer current")
+	}
+	task.ResultImportStatus = status
+	task.ResultImportError = importErr
+	if status == model.ResultImportStatusSuccess {
+		task.ResultImportedAt = &finishedAt
+	} else {
+		task.ResultImportedAt = nil
+	}
+	task.ResultImportStartedAt = nil
+	task.ResultImportFingerprint = fingerprint
+	task.UpdatedAt = finishedAt
+	return nil
+}
+
+// TaskRepository provides task-specific operations
+type TaskRepository struct {
+	*Repository[model.Task]
+	bamRetentionBucket string
+}
+
+// NewTaskRepository creates a new task repository
+func NewTaskRepository() *TaskRepository {
+	return &TaskRepository{
+		Repository: NewRepository[model.Task](),
+	}
+}
+
+// FindByUUID finds a task by UUID
+func (r *TaskRepository) FindByUUID(uuid string) (*model.Task, error) {
+	return r.FindOneByCondition(map[string]interface{}{"uuid": uuid})
+}
+
+// FindByStatus finds tasks by status
+func (r *TaskRepository) FindByStatus(status model.TaskStatus) ([]model.Task, error) {
+	return r.FindByCondition(map[string]interface{}{"status": status})
+}
+
+// FindBySampleID finds tasks by sample UUID
+func (r *TaskRepository) FindBySampleID(sampleID string) ([]model.Task, error) {
+	return r.FindByCondition(map[string]interface{}{"sample_id": sampleID})
+}
+
+// FindByCreator finds tasks created by a user
+func (r *TaskRepository) FindByCreator(userID uint) ([]model.Task, error) {
+	return r.FindByCondition(map[string]interface{}{"created_by": userID})
+}
+
+// UpdateStatus updates task status
+func (r *TaskRepository) UpdateStatus(id string, status model.TaskStatus) error {
+	return r.db.Model(&model.Task{}).Where("id = ?", id).Update("status", status).Error
+}
+
+// FindByStatuses finds tasks by multiple statuses
+func (r *TaskRepository) FindByStatuses(statuses []model.TaskStatus) ([]model.Task, error) {
+	var tasks []model.Task
+	err := r.db.Where("status IN ?", statuses).Find(&tasks).Error
+	return tasks, err
+}
+
+// FindPendingCVMArchiveTermination returns terminal CVM attempts whose COS
+// archive was staged but whose release request has not yet reached Onykia.
+func (r *TaskRepository) FindPendingCVMArchiveTermination() ([]model.Task, error) {
+	var tasks []model.Task
+	err := r.db.
+		Where("executor = ? AND status IN ? AND cvm_archive_staged_at IS NOT NULL AND cvm_archive_termination_notified_at IS NULL", model.ExecutorCVM, []model.TaskStatus{model.TaskStatusCompleted, model.TaskStatusPendingInterpretation}).
+		Find(&tasks).Error
+	return tasks, err
+}
+
+// FindByUploadJobID finds tasks by upload job UUID
+func (r *TaskRepository) FindByUploadJobID(uploadJobID string) ([]model.Task, error) {
+	return r.FindByCondition(map[string]interface{}{"upload_job_id": uploadJobID})
+}
+
+// CountByStatus counts tasks by status
+func (r *TaskRepository) CountByStatus() (map[model.TaskStatus]int64, error) {
+	counts := make(map[model.TaskStatus]int64)
+	statuses := []model.TaskStatus{
+		model.TaskStatusQueued,
+		model.TaskStatusWaitingData,
+		model.TaskStatusRunning,
+		model.TaskStatusCompleted,
+		model.TaskStatusFailed,
+		model.TaskStatusCancelled,
+		model.TaskStatusPendingInterpretation,
+	}
+
+	for _, status := range statuses {
+		var count int64
+		err := r.db.Model(&model.Task{}).
+			Where("status = ?", status).
+			Count(&count).Error
+		if err != nil {
+			return nil, err
+		}
+		counts[status] = count
+	}
+
+	return counts, nil
+}
+
+// CountByStatusAndProject counts tasks by status for a project
+func (r *TaskRepository) CountByStatusAndProject(projectID uint) (map[model.TaskStatus]int64, error) {
+	counts := make(map[model.TaskStatus]int64)
+	statuses := []model.TaskStatus{
+		model.TaskStatusQueued,
+		model.TaskStatusWaitingData,
+		model.TaskStatusRunning,
+		model.TaskStatusCompleted,
+		model.TaskStatusFailed,
+		model.TaskStatusCancelled,
+		model.TaskStatusPendingInterpretation,
+	}
+
+	for _, status := range statuses {
+		var count int64
+		err := r.db.Model(&model.Task{}).
+			Where("project_id = ? AND status = ?", projectID, status).
+			Count(&count).Error
+		if err != nil {
+			return nil, err
+		}
+		counts[status] = count
+	}
+
+	return counts, nil
+}
+
+// PaginateByQuery paginates tasks with multiple filters
+func (r *TaskRepository) PaginateByQuery(query *model.TaskListQuery) ([]model.Task, int64, error) {
+	db := r.db.Model(&model.Task{})
+	if query.SharedInstance {
+		db = db.Where("COALESCE(tasks.external_org_id, '') = ''")
+	}
+	if query.TenantID != "" && !query.IncludeAll {
+		db = db.Where("tenant_id = ?", query.TenantID)
+	} else {
+		db = applyTaskActorScope(db, query.ExternalOrgID, query.CreatedBy, query.IncludeAll)
+	}
+	if query.Status == "interpretation_completed" {
+		db = db.Where("interpretation_completed_at IS NOT NULL")
+	} else if query.Status != "" {
+		db = db.Where("status = ? AND interpretation_completed_at IS NULL", query.Status)
+	}
+	if query.SampleID != "" {
+		db = db.Where("sample_id = ?", query.SampleID)
+	}
+	if query.Search != "" {
+		like := "%" + query.Search + "%"
+		db = db.Where("name ILIKE ? OR internal_id ILIKE ? OR error ILIKE ?", like, like, like)
+	}
+	if query.OrgID != "" {
+		db = db.Where("external_org_id = ?", query.OrgID)
+	}
+	if query.CreatedSince != nil {
+		db = db.Where("created_at >= ?", *query.CreatedSince)
+	}
+	if query.UpdatedSince != nil {
+		db = db.Where("updated_at >= ?", *query.UpdatedSince)
+	}
+
+	var total int64
+	err := db.Count(&total).Error
+	if err != nil {
+		return nil, 0, err
+	}
+
+	page := query.Page
+	if page < 1 {
+		page = 1
+	}
+	pageSize := query.PageSize
+	if pageSize < 1 {
+		pageSize = 10
+	}
+
+	var tasks []model.Task
+	offset := (page - 1) * pageSize
+	err = db.Order("CASE WHEN interpretation_completed_at IS NULL THEN 0 ELSE 1 END ASC").Order("COALESCE(retry_started_at, created_at) DESC").Order("uuid ASC").Offset(offset).Limit(pageSize).Find(&tasks).Error
+	return tasks, total, err
+}

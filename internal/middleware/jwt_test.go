@@ -1,0 +1,247 @@
+package middleware
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/SchemaBio/Loligo/internal/config"
+	"github.com/SchemaBio/Loligo/internal/model"
+	"github.com/SchemaBio/Loligo/internal/service"
+	"github.com/gin-gonic/gin"
+)
+
+func testExternalAuthConfig() *config.Config {
+	return &config.Config{
+		JWT: config.JWTConfig{
+			Secret:          "test-secret-with-at-least-32-characters",
+			Issuer:          "loligo-test",
+			ExpireDuration:  time.Hour,
+			RefreshDuration: 24 * time.Hour,
+		},
+		ExternalAuth: config.ExternalAuthConfig{
+			Enabled:      true,
+			SharedSecret: "shared-overlay-secret",
+			HeaderName:   "X-Loligo-External-Auth",
+			UserIDHeader: "X-Loligo-User-ID",
+			EmailHeader:  "X-Loligo-User-Email",
+			RoleHeader:   "X-Loligo-User-Role",
+			OrgIDHeader:  "X-Loligo-Org-ID",
+		},
+	}
+}
+
+func TestJWTAuthAcceptsTrustedExternalAuthHeaders(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	router := gin.New()
+	router.Use(JWTAuth(testExternalAuthConfig()))
+	router.GET("/protected", func(c *gin.Context) {
+		userID, email, role, ok := GetCurrentUser(c)
+		orgID, hasOrg := GetCurrentOrg(c)
+		storageQuotaBytes, hasStorageQuota := GetCurrentStorageQuotaBytes(c)
+		if !ok || !hasOrg || !hasStorageQuota {
+			t.Fatalf("expected external user, organization, and storage quota in context")
+		}
+		if userID != 42 || email != "user@example.com" || role != string(model.SystemRoleUser) || orgID != "org-1" {
+			t.Fatalf("unexpected context values: userID=%d email=%q role=%q orgID=%q", userID, email, role, orgID)
+		}
+		if storageQuotaBytes != 50*1024*1024*1024 {
+			t.Fatalf("unexpected storage quota: %d", storageQuotaBytes)
+		}
+		c.Status(http.StatusOK)
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/protected", nil)
+	req.Header.Set("X-Loligo-External-Auth", "Bearer shared-overlay-secret")
+	req.Header.Set("X-Loligo-User-ID", "42")
+	req.Header.Set("X-Loligo-User-Email", "user@example.com")
+	req.Header.Set("X-Loligo-User-Role", "PLATFORM_ADMIN")
+	req.Header.Set("X-Loligo-Org-ID", "org-1")
+	req.Header.Set("X-Loligo-Storage-Quota-Bytes", "53687091200")
+	resp := httptest.NewRecorder()
+
+	router.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected trusted external auth to pass, got %d", resp.Code)
+	}
+}
+
+// TestJWTAuthMapsOverlayRoles asserts the trusted-overlay role translation:
+// ORG_USER -> USER, and any unrecognized role name degrades to USER
+// (least-privilege) rather than escalating or rejecting.
+func TestJWTAuthMapsOverlayRoles(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	cases := []struct {
+		header string
+		want   string
+	}{
+		{"ORG_USER", string(model.SystemRoleUser)},
+		{"org_user", string(model.SystemRoleUser)},    // case-insensitive
+		{"org_admin", string(model.SystemRoleUser)},   // unknown -> USER
+		{"", string(model.SystemRoleUser)},            // empty -> USER
+		{"SUPER_ADMIN", string(model.SystemRoleUser)}, // admin names require break-glass
+	}
+	for _, tc := range cases {
+		t.Run(tc.header, func(t *testing.T) {
+			router := gin.New()
+			router.Use(JWTAuth(testExternalAuthConfig()))
+			router.GET("/protected", func(c *gin.Context) {
+				_, _, role, ok := GetCurrentUser(c)
+				if !ok {
+					t.Fatalf("expected external user in context")
+				}
+				if role != tc.want {
+					t.Fatalf("role %q should map to %q, got %q", tc.header, tc.want, role)
+				}
+				c.Status(http.StatusOK)
+			})
+
+			req := httptest.NewRequest(http.MethodGet, "/protected", nil)
+			req.Header.Set("X-Loligo-External-Auth", "Bearer shared-overlay-secret")
+			req.Header.Set("X-Loligo-User-ID", "42")
+			req.Header.Set("X-Loligo-User-Email", "user@example.com")
+			if tc.header != "" {
+				req.Header.Set("X-Loligo-User-Role", tc.header)
+			}
+			resp := httptest.NewRecorder()
+			router.ServeHTTP(resp, req)
+
+			if resp.Code != http.StatusOK {
+				t.Fatalf("expected trusted external auth to pass, got %d", resp.Code)
+			}
+		})
+	}
+}
+
+func TestJWTAuthAcceptsSignedIdentityToken(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	cfg := testExternalAuthConfig()
+	token, err := service.SignIdentityToken(cfg.ExternalAuth.SharedSecret, service.IdentityClaims{
+		UserID: 42, Email: "user@example.com", Role: "ORG_USER", OrgID: "org-1", StorageQuotaBytes: 50,
+	}, time.Now())
+	if err != nil {
+		t.Fatalf("SignIdentityToken: %v", err)
+	}
+	router := gin.New()
+	router.Use(JWTAuth(cfg))
+	router.GET("/protected", func(c *gin.Context) {
+		userID, email, role, ok := GetCurrentUser(c)
+		orgID, hasOrg := GetCurrentOrg(c)
+		if !ok || !hasOrg || userID != 42 || email != "user@example.com" || role != string(model.SystemRoleUser) || orgID != "org-1" {
+			t.Fatalf("unexpected identity: %d %s %s %s", userID, email, role, orgID)
+		}
+		c.Status(http.StatusOK)
+	})
+	req := httptest.NewRequest(http.MethodGet, "/protected", nil)
+	req.Header.Set("X-Loligo-External-Auth", "Bearer "+token)
+	req.Header.Set("X-Loligo-User-ID", "999")
+	req.Header.Set("X-Loligo-User-Role", "PLATFORM_ADMIN")
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected signed identity to pass, got %d", resp.Code)
+	}
+}
+
+func TestJWTAuthBreakGlassMapsPlatformAdmin(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.Use(JWTAuth(testExternalAuthConfig()))
+	router.GET("/protected", func(c *gin.Context) {
+		_, _, role, ok := GetCurrentUser(c)
+		if !ok || role != string(model.SystemRoleSuperAdmin) {
+			t.Fatalf("expected break-glass platform admin to map to SUPER_ADMIN, got %q ok=%v", role, ok)
+		}
+		c.Status(http.StatusOK)
+	})
+	req := httptest.NewRequest(http.MethodGet, "/protected", nil)
+	req.Header.Set("X-Loligo-External-Auth", "Bearer shared-overlay-secret")
+	req.Header.Set("X-Loligo-User-ID", "42")
+	req.Header.Set("X-Loligo-User-Email", "user@example.com")
+	req.Header.Set("X-Loligo-User-Role", "PLATFORM_ADMIN")
+	req.Header.Set("X-Onykia-Break-Glass", "1")
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected break-glass admin mapping to pass, got %d", resp.Code)
+	}
+}
+
+func TestJWTAuthRejectsInvalidExternalIdentity(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	router := gin.New()
+	router.Use(JWTAuth(testExternalAuthConfig()))
+	router.GET("/protected", func(c *gin.Context) {
+		t.Fatal("handler should not run for invalid external identity")
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/protected", nil)
+	req.Header.Set("X-Loligo-External-Auth", "shared-overlay-secret")
+	req.Header.Set("X-Loligo-User-ID", "not-a-number")
+	resp := httptest.NewRecorder()
+
+	router.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusUnauthorized {
+		t.Fatalf("expected invalid external identity to be unauthorized, got %d", resp.Code)
+	}
+}
+
+func TestJWTAuthFallsBackWhenExternalSecretDoesNotMatch(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	router := gin.New()
+	router.Use(JWTAuth(testExternalAuthConfig()))
+	router.GET("/protected", func(c *gin.Context) {
+		t.Fatal("handler should not run without a valid JWT")
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/protected", nil)
+	req.Header.Set("X-Loligo-External-Auth", "wrong-secret")
+	req.Header.Set("X-Loligo-User-ID", "42")
+	resp := httptest.NewRecorder()
+
+	router.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusUnauthorized {
+		t.Fatalf("expected fallback JWT auth to reject missing token, got %d", resp.Code)
+	}
+}
+
+func TestRequireAdminRejectsMalformedRoleWithoutPanic(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("role", 123)
+		c.Next()
+	})
+	router.GET("/admin", RequireAdmin(), func(c *gin.Context) {
+		c.Status(http.StatusOK)
+	})
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/admin", nil)
+	router.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusForbidden {
+		t.Fatalf("expected malformed role to be forbidden, got %d", resp.Code)
+	}
+}
+
+func TestGetCurrentUserRejectsMalformedContext(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Set("user_id", "not-a-uint")
+	c.Set("email", "user@example.com")
+	c.Set("role", string(model.SystemRoleUser))
+
+	if _, _, _, ok := GetCurrentUser(c); ok {
+		t.Fatal("expected malformed user_id to be rejected")
+	}
+}

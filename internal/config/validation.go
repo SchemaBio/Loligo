@@ -1,0 +1,309 @@
+package config
+
+import (
+	"fmt"
+	"net"
+	"net/url"
+	"os"
+	"strings"
+	"time"
+)
+
+// ValidateStartup checks the configuration for common mistakes at server startup.
+func ValidateStartup(cfg *Config) error {
+	if cfg.Edition != "" && cfg.Edition != "opensource" && cfg.Edition != "saas" {
+		return fmt.Errorf("DEPLOYMENT_EDITION must be opensource or saas")
+	}
+	if cfg.RetentionCleanupEnabled && !cfg.RetentionBackupPolicyVerified {
+		return fmt.Errorf("verify backup and object version policies before enabling retention cleanup")
+	}
+	if cfg.RetentionCleanupEnabled && !cfg.IsSaaS() {
+		return fmt.Errorf("retention cleanup requires SaaS edition")
+	}
+	if cfg.IsSaaS() && (!cfg.Overlay.Enabled || cfg.Storage.Provider != "s3") {
+		return fmt.Errorf("SaaS requires the overlay and object storage")
+	}
+
+	for _, name := range []string{"PARQUET_QUERY_URL", "RESULT_ENGINE_BACKEND", "SVC_ENGINE_BACKEND"} {
+		if strings.TrimSpace(os.Getenv(name)) != "" {
+			return fmt.Errorf("%s was removed: result and SVC engines now run inside Loligo; remove this legacy environment setting", name)
+		}
+	}
+	if cfg.Storage.ResultDownloadLinkTTL != 0 && (cfg.Storage.ResultDownloadLinkTTL < time.Minute || cfg.Storage.ResultDownloadLinkTTL > time.Hour) {
+		return fmt.Errorf("RESULT_DOWNLOAD_LINK_TTL must be between 1m and 1h")
+	}
+	ttl := cfg.Storage.ResultDownloadLinkTTL
+	if ttl == 0 {
+		ttl = 30 * time.Minute
+	}
+	if cfg.Storage.ResultDownloadRefreshInterval != 0 && (cfg.Storage.ResultDownloadRefreshInterval < time.Second || cfg.Storage.ResultDownloadRefreshInterval > ttl) {
+		return fmt.Errorf("RESULT_DOWNLOAD_REFRESH_INTERVAL must be positive and no longer than the link TTL")
+	}
+	if cfg.Storage.ResultDownloadMaxIssues != 0 && (cfg.Storage.ResultDownloadMaxIssues < 1 || cfg.Storage.ResultDownloadMaxIssues > 100) {
+		return fmt.Errorf("RESULT_DOWNLOAD_MAX_ISSUES must be between 1 and 100")
+	}
+	if cfg.Storage.ResultDownloadTrafficLimit != 0 && (cfg.Storage.ResultDownloadTrafficLimit < 819200 || cfg.Storage.ResultDownloadTrafficLimit > 838860800) {
+		return fmt.Errorf("RESULT_DOWNLOAD_TRAFFIC_LIMIT_BPS must be between 819200 and 838860800")
+	}
+	for _, proxy := range cfg.Server.TrustedProxies {
+		if net.ParseIP(proxy) != nil {
+			continue
+		}
+		if _, _, err := net.ParseCIDR(proxy); err != nil {
+			return fmt.Errorf("TRUSTED_PROXIES contains invalid IP or CIDR %q", proxy)
+		}
+	}
+	// In release mode, enforce stronger JWT secret
+	if cfg.Server.Mode == "release" {
+		if err := validateJWTSecret(cfg.JWT.Secret); err != nil {
+			return fmt.Errorf("JWT configuration error: %w", err)
+		}
+		if err := validateReleaseCORSOrigins(cfg.Server.AllowedOrigins); err != nil {
+			return err
+		}
+		if !cfg.JWT.CookieSecure {
+			return fmt.Errorf("JWT_COOKIE_SECURE must be true in release mode")
+		}
+	}
+	if cfg.ExternalAuth.Enabled && cfg.ExternalAuth.SharedSecret == "" {
+		return fmt.Errorf("EXTERNAL_AUTH_SHARED_SECRET must be set when external auth is enabled")
+	}
+	if cfg.Server.Mode == "release" && cfg.ExternalAuth.Enabled {
+		if err := validateSharedSecret("EXTERNAL_AUTH_SHARED_SECRET", cfg.ExternalAuth.SharedSecret); err != nil {
+			return err
+		}
+	}
+	if cfg.Overlay.Enabled {
+		if strings.TrimSpace(cfg.Overlay.BaseURL) == "" {
+			return fmt.Errorf("OVERLAY_BASE_URL must be set when overlay is enabled")
+		}
+		if cfg.Overlay.SharedSecret == "" {
+			return fmt.Errorf("OVERLAY_SHARED_SECRET must be set when overlay is enabled")
+		}
+		if cfg.Server.Mode == "release" {
+			if err := validateSharedSecret("OVERLAY_SHARED_SECRET", cfg.Overlay.SharedSecret); err != nil {
+				return err
+			}
+		}
+	}
+	if cfg.Sepiida.Enabled {
+		if cfg.Sepiida.FirstReportTimeout <= 0 {
+			return fmt.Errorf("SEPIIDA_FIRST_REPORT_TIMEOUT must be positive")
+		}
+		if cfg.Sepiida.QueryGracePeriod < 0 {
+			return fmt.Errorf("SEPIIDA_QUERY_GRACE_PERIOD must not be negative")
+		}
+		if strings.TrimSpace(cfg.Sepiida.QueryKey) != "" {
+			if err := validateAbsoluteServiceURL("SEPIIDA_URL", cfg.Sepiida.ServerURL); err != nil {
+				return err
+			}
+		}
+		if cfg.Server.Mode == "release" {
+			if strings.TrimSpace(cfg.Sepiida.QueryKey) == "" {
+				return fmt.Errorf("SEPIIDA_QUERY_KEY must be set when Sepiida is enabled in release mode")
+			}
+			if err := validateSharedSecret("SEPIIDA_QUERY_KEY", cfg.Sepiida.QueryKey); err != nil {
+				return err
+			}
+		}
+	}
+	if cfg.LLM.Enabled {
+		if strings.TrimSpace(cfg.LLM.BaseURL) == "" {
+			return fmt.Errorf("LLM_BASE_URL must be set when LLM is enabled")
+		}
+		if strings.TrimSpace(cfg.LLM.APIKey) == "" {
+			return fmt.Errorf("LLM_API_KEY must be set when LLM is enabled")
+		}
+		if cfg.Server.Mode == "release" {
+			if err := validateReleaseHTTPSURL("LLM_BASE_URL", cfg.LLM.BaseURL); err != nil {
+				return err
+			}
+		}
+	}
+	if err := validateDatabaseTLS(cfg.Database.DSN); err != nil {
+		return err
+	}
+	if cfg.Storage.BAMRetentionDays != 0 && cfg.Storage.BAMRetentionDays != 7 {
+		return fmt.Errorf("BAM_RETENTION_DAYS must be 0 or 7")
+	}
+	if cfg.Storage.BAMCleanupEnabled && (cfg.Storage.BAMRetentionDays != 7 || cfg.Storage.Provider != "s3") {
+		return fmt.Errorf("BAM cleanup requires the 7-day policy and COS/S3 storage")
+	}
+	if cfg.Storage.RetentionDays < 0 {
+		return fmt.Errorf("DATA_RETENTION_DAYS must be zero or greater")
+	}
+	if cfg.Storage.Provider == "s3" {
+		if strings.TrimSpace(cfg.Storage.S3Bucket) == "" {
+			return fmt.Errorf("S3_BUCKET must be set when STORAGE_PROVIDER=s3")
+		}
+		if (cfg.Storage.S3AccessKey == "") != (cfg.Storage.S3SecretKey == "") {
+			return fmt.Errorf("S3_ACCESS_KEY and S3_SECRET_KEY must be configured together")
+		}
+		if cfg.Storage.S3Endpoint != "" {
+			if err := validateAbsoluteServiceURL("S3_ENDPOINT", cfg.Storage.S3Endpoint); err != nil {
+				return err
+			}
+		}
+		if cfg.Storage.S3PublicEndpoint != "" {
+			if err := validateAbsoluteServiceURL("S3_PUBLIC_ENDPOINT", cfg.Storage.S3PublicEndpoint); err != nil {
+				return err
+			}
+			if cfg.Server.Mode == "release" {
+				if err := validateReleaseHTTPSURL("S3_PUBLIC_ENDPOINT", cfg.Storage.S3PublicEndpoint); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	if cfg.IGV.ReferenceProxyBaseURL != "" {
+		if err := validateAbsoluteServiceURL("IGV_REFERENCE_PROXY_BASE_URL", cfg.IGV.ReferenceProxyBaseURL); err != nil {
+			return err
+		}
+		if cfg.Server.Mode == "release" {
+			if err := validateReleaseHTTPSURL("IGV_REFERENCE_PROXY_BASE_URL", cfg.IGV.ReferenceProxyBaseURL); err != nil {
+				return err
+			}
+		}
+	}
+	if err := validateIGVReferenceConfig("IGV_HG19", cfg.IGV.HG19, cfg.Server.Mode); err != nil {
+		return err
+	}
+	if err := validateIGVReferenceConfig("IGV_HG38", cfg.IGV.HG38, cfg.Server.Mode); err != nil {
+		return err
+	}
+	if cfg.Task.DefaultExecutor == "cvm_spot" {
+		if !cfg.Overlay.Enabled {
+			return fmt.Errorf("OVERLAY_ENABLED must be true when DEFAULT_EXECUTOR=cvm_spot")
+		}
+		if cfg.Storage.Provider != "s3" {
+			return fmt.Errorf("STORAGE_PROVIDER must be cos or s3 when DEFAULT_EXECUTOR=cvm_spot")
+		}
+		if cfg.Overlay.FailOpen {
+			return fmt.Errorf("OVERLAY_FAIL_OPEN must be false when DEFAULT_EXECUTOR=cvm_spot")
+		}
+		if strings.TrimSpace(cfg.ExternalAuth.CallbackSecret) == "" {
+			return fmt.Errorf("CVM_CALLBACK_SECRET must be set when DEFAULT_EXECUTOR=cvm_spot")
+		}
+		if cfg.ExternalAuth.CallbackSecret == cfg.ExternalAuth.SharedSecret {
+			return fmt.Errorf("CVM_CALLBACK_SECRET must be distinct from EXTERNAL_AUTH_SHARED_SECRET")
+		}
+		if cfg.Server.Mode == "release" {
+			if err := validateSharedSecret("CVM_CALLBACK_SECRET", cfg.ExternalAuth.CallbackSecret); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+func validateIGVReferenceConfig(prefix string, ref IGVReferenceConfig, mode string) error {
+	values := map[string]string{
+		prefix + "_FASTA_URL":            ref.FASTAURL,
+		prefix + "_FAI_URL":              ref.FAIURL,
+		prefix + "_ALIAS_URL":            ref.AliasURL,
+		prefix + "_CYTOBAND_URL":         ref.CytobandURL,
+		prefix + "_GENE_TRACK_URL":       ref.GeneTrackURL,
+		prefix + "_GENE_TRACK_INDEX_URL": ref.GeneTrackIndexURL,
+	}
+	for name, value := range values {
+		if strings.TrimSpace(value) == "" {
+			continue
+		}
+		if err := validateAbsoluteServiceURL(name, value); err != nil {
+			return err
+		}
+		if mode == "release" {
+			if err := validateReleaseHTTPSURL(name, value); err != nil {
+				return err
+			}
+		}
+	}
+	if (strings.TrimSpace(ref.FASTAURL) == "") != (strings.TrimSpace(ref.FAIURL) == "") {
+		return fmt.Errorf("%s_FASTA_URL and %s_FAI_URL must be configured together", prefix, prefix)
+	}
+	if (strings.TrimSpace(ref.GeneTrackURL) == "") != (strings.TrimSpace(ref.GeneTrackIndexURL) == "") {
+		return fmt.Errorf("%s_GENE_TRACK_URL and %s_GENE_TRACK_INDEX_URL must be configured together", prefix, prefix)
+	}
+	return nil
+}
+
+func validateAbsoluteServiceURL(name, rawURL string) error {
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return fmt.Errorf("%s must be a valid absolute URL", name)
+	}
+	if u.User != nil {
+		return fmt.Errorf("%s must not include user info", name)
+	}
+	if !strings.EqualFold(u.Scheme, "http") && !strings.EqualFold(u.Scheme, "https") {
+		return fmt.Errorf("%s must use http or https", name)
+	}
+	return nil
+}
+
+func validateSharedSecret(name, secret string) error {
+	if len(strings.TrimSpace(secret)) < 32 {
+		return fmt.Errorf("%s must be at least 32 characters in release mode", name)
+	}
+	lower := strings.ToLower(secret)
+	if strings.Contains(lower, "change") || strings.Contains(lower, "secret") || strings.Contains(lower, "default") {
+		return fmt.Errorf("%s appears to be a default value; please set a strong random secret", name)
+	}
+	return nil
+}
+
+// validateJWTSecret checks that the JWT secret is not a default/weak value in release mode.
+func validateJWTSecret(secret string) error {
+	if secret == "" {
+		return fmt.Errorf("JWT_SECRET must not be empty in release mode")
+	}
+	if len(secret) < 32 {
+		return fmt.Errorf("JWT_SECRET must be at least 32 characters in release mode")
+	}
+	// Check for default development secrets
+	lower := strings.ToLower(secret)
+	if strings.Contains(lower, "change-in-production") ||
+		strings.Contains(lower, "secret-key") ||
+		strings.Contains(lower, "default") {
+		return fmt.Errorf("JWT_SECRET appears to be a default value; please set a strong secret in production")
+	}
+	return nil
+}
+
+func validateReleaseHTTPSURL(name, rawURL string) error {
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return fmt.Errorf("%s must be a valid absolute URL in release mode", name)
+	}
+	if u.User != nil {
+		return fmt.Errorf("%s must not include user info in release mode", name)
+	}
+	if !strings.EqualFold(u.Scheme, "https") {
+		return fmt.Errorf("%s must use https in release mode", name)
+	}
+	if strings.EqualFold(u.Hostname(), "localhost") {
+		return fmt.Errorf("%s host is not allowed in release mode", name)
+	}
+	return nil
+}
+
+func validateReleaseCORSOrigins(origins string) error {
+	parts := splitComma(origins)
+	if len(parts) == 0 {
+		return fmt.Errorf("CORS_ALLOWED_ORIGINS must be set in release mode")
+	}
+	for _, origin := range parts {
+		if origin == "*" || strings.Contains(origin, "*") {
+			return fmt.Errorf("CORS_ALLOWED_ORIGINS must not contain wildcards in release mode")
+		}
+		u, err := url.Parse(origin)
+		if err != nil || u.Scheme == "" || u.Host == "" || u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
+			return fmt.Errorf("CORS_ALLOWED_ORIGINS contains invalid origin %q", origin)
+		}
+		if !strings.EqualFold(u.Scheme, "https") {
+			return fmt.Errorf("CORS_ALLOWED_ORIGINS must use https origins in release mode")
+		}
+	}
+	return nil
+}

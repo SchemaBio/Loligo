@@ -1,0 +1,461 @@
+package model
+
+import (
+	"encoding/json"
+	"path"
+	"strconv"
+	"strings"
+	"time"
+
+	"gorm.io/gorm"
+)
+
+// Gender represents gender
+type SampleGender string
+
+const (
+	SampleGenderMale    SampleGender = "male"
+	SampleGenderFemale  SampleGender = "female"
+	SampleGenderUnknown SampleGender = "unknown"
+)
+
+// SampleTypeFrontend represents sample type matching frontend
+type SampleTypeFrontend string
+
+const (
+	SampleTypeWholeBlood SampleTypeFrontend = "全血"
+	SampleTypeSaliva     SampleTypeFrontend = "唾液"
+	SampleTypeDNA        SampleTypeFrontend = "DNA"
+	SampleTypeTissue     SampleTypeFrontend = "组织"
+	SampleTypeOther      SampleTypeFrontend = "其他"
+)
+
+// SampleStatus represents the status of a sample
+type SampleStatus string
+
+type SampleMatchStatus string
+type SampleMatchMode string
+
+const (
+	SampleStatusPending    SampleStatus = "pending"
+	SampleStatusProcessing SampleStatus = "processing"
+	SampleStatusCompleted  SampleStatus = "completed"
+	SampleStatusFailed     SampleStatus = "failed"
+)
+
+const (
+	SampleMatchUnmatched SampleMatchStatus = "unmatched"
+	SampleMatchPartial   SampleMatchStatus = "partial"
+	SampleMatchConflict  SampleMatchStatus = "conflict"
+	SampleMatchMatched   SampleMatchStatus = "matched"
+	SampleMatchMissing   SampleMatchStatus = "missing"
+)
+
+const (
+	SampleMatchModeManual    SampleMatchMode = "manual"
+	SampleMatchModeAutomatic SampleMatchMode = "automatic"
+)
+
+// Sample represents a biological sample (germline)
+type Sample struct {
+	SampleParents
+
+	ID                           uint               `json:"-" gorm:"primaryKey"`
+	UUID                         string             `json:"id" gorm:"uniqueIndex;size:36;not null"`
+	InternalID                   string             `json:"internal_id" gorm:"index;size:100;not null"`
+	ExternalOrgID                string             `json:"-" gorm:"size:100;index"`
+	Gender                       SampleGender       `json:"gender" gorm:"size:20;default:unknown"`
+	Age                          *int               `json:"age,omitempty"`
+	SampleType                   SampleTypeFrontend `json:"sample_type" gorm:"size:20;default:其他"`
+	Batch                        string             `json:"batch" gorm:"size:100"`
+	ClinicalDiagnosis            string             `json:"clinical_diagnosis" gorm:"type:jsonb"`    // JSON
+	HPOTerms                     string             `json:"-" gorm:"type:jsonb"`                     // JSON
+	MatchedPair                  string             `json:"-" gorm:"column:matched_pair;type:jsonb"` // Legacy JSON, retained for migration compatibility
+	AutoMatchedPair              string             `json:"-" gorm:"type:jsonb"`                     // Automatically matched FASTQ pair
+	ManualMatchedPair            string             `json:"-" gorm:"type:jsonb"`                     // Explicit user-selected FASTQ pair
+	SubmissionInfo               string             `json:"-" gorm:"type:jsonb"`                     // JSON
+	ProjectInfo                  string             `json:"-" gorm:"type:jsonb"`                     // JSON
+	FamilyHistory                string             `json:"-" gorm:"type:jsonb"`                     // JSON
+	Remark                       string             `json:"remark" gorm:"type:text"`
+	Status                       SampleStatus       `json:"status" gorm:"size:20;default:pending"`
+	ProjectID                    uint               `json:"project_id" gorm:"index"`
+	CreatedBy                    uint               `json:"created_by" gorm:"index"`
+	MatchStatus                  SampleMatchStatus  `json:"match_status" gorm:"size:20;index;not null;default:unmatched"`
+	MatchMode                    SampleMatchMode    `json:"match_mode" gorm:"size:20;index"`
+	AutoMatchEnabled             bool               `json:"auto_match_enabled" gorm:"not null;default:true"`
+	ExpiresAt                    *time.Time         `json:"expires_at,omitempty" gorm:"index;type:timestamptz"`
+	IdentityPolicyVersion        string             `json:"-" gorm:"size:64"`
+	IdentityPolicyAcknowledgedAt *time.Time         `json:"-" gorm:"type:timestamptz"`
+	CreatedAt                    time.Time          `json:"created_at" gorm:"type:timestamptz"`
+	UpdatedAt                    time.Time          `json:"updated_at" gorm:"type:timestamptz"`
+}
+
+func (s *Sample) BeforeSave(_ *gorm.DB) error {
+	if strings.TrimSpace(s.MatchedPair) == "" {
+		s.MatchedPair = "null"
+	}
+	if strings.TrimSpace(s.AutoMatchedPair) == "" {
+		s.AutoMatchedPair = "null"
+	}
+	if strings.TrimSpace(s.ManualMatchedPair) == "" {
+		s.ManualMatchedPair = "null"
+	}
+	return nil
+}
+
+// HPOTerm represents an HPO term
+type HPOTerm struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+// MatchedPair represents FASTQ file pair
+type MatchedPair struct {
+	R1Path string `json:"r1Path"`
+	R2Path string `json:"r2Path"`
+}
+
+// ClinicalDiagnosisInfo is the structured clinical diagnosis
+type ClinicalDiagnosisInfo struct {
+	MainDiagnosis  string    `json:"mainDiagnosis"`
+	Symptoms       []string  `json:"symptoms"`
+	HPOTerms       []HPOTerm `json:"hpoTerms,omitempty"`
+	OnsetAge       string    `json:"onsetAge,omitempty"`
+	DiseaseHistory string    `json:"diseaseHistory,omitempty"`
+}
+
+// SubmissionInfo represents sample submission details
+type SubmissionInfo struct {
+	SubmissionDate       string `json:"submissionDate"`
+	SampleCollectionDate string `json:"sampleCollectionDate"`
+	SampleReceiveDate    string `json:"sampleReceiveDate"`
+	SampleQuality        string `json:"sampleQuality"` // good, acceptable, poor
+}
+
+// ProjectInfo represents project association
+type ProjectInfo struct {
+	ProjectID      string   `json:"projectId"`
+	ProjectName    string   `json:"projectName"`
+	TestItems      []string `json:"testItems"`
+	Panel          string   `json:"panel,omitempty"`
+	TurnaroundDays int      `json:"turnaroundDays"`
+	Priority       string   `json:"priority"` // normal, urgent
+}
+
+// FamilyHistoryInfo represents family history
+type FamilyHistoryInfo struct {
+	HasHistory      bool             `json:"hasHistory"`
+	AffectedMembers []AffectedMember `json:"affectedMembers,omitempty"`
+	PedigreeNote    string           `json:"pedigreeNote,omitempty"`
+}
+
+// AffectedMember represents an affected family member
+type AffectedMember struct {
+	Relation  string `json:"relation"`
+	Condition string `json:"condition"`
+	OnsetAge  string `json:"onsetAge,omitempty"`
+}
+
+// SampleResponse is the API response for a sample list item
+type SampleResponse struct {
+	SampleParents
+
+	ExpiresAt         *time.Time         `json:"expires_at,omitempty"`
+	ID                string             `json:"id"`
+	InternalID        string             `json:"internal_id"`
+	Gender            SampleGender       `json:"gender"`
+	Age               *int               `json:"age,omitempty"`
+	SampleType        SampleTypeFrontend `json:"sample_type"`
+	Batch             string             `json:"batch"`
+	ClinicalDiagnosis string             `json:"clinical_diagnosis"`
+	HPOTerms          []HPOTerm          `json:"hpo_terms"`
+	MatchedPair       *MatchedPair       `json:"matched_pair,omitempty"`
+	MatchStatus       SampleMatchStatus  `json:"match_status"`
+	MatchMode         SampleMatchMode    `json:"match_mode,omitempty"`
+	AutoMatchEnabled  bool               `json:"auto_match_enabled"`
+	Remark            string             `json:"remark"`
+	Status            SampleStatus       `json:"status"`
+	CreatedAt         string             `json:"created_at"`
+	UpdatedAt         string             `json:"updated_at"`
+}
+
+// SampleDetailResponse is the API response for a sample detail
+type SampleDetailResponse struct {
+	SampleParents
+
+	ExpiresAt         *time.Time            `json:"expires_at,omitempty"`
+	ID                string                `json:"id"`
+	InternalID        string                `json:"internal_id"`
+	Gender            SampleGender          `json:"gender"`
+	Age               *int                  `json:"age,omitempty"`
+	SampleType        SampleTypeFrontend    `json:"sample_type"`
+	Batch             string                `json:"batch"`
+	MatchedPair       *MatchedPair          `json:"matched_pair,omitempty"`
+	MatchStatus       SampleMatchStatus     `json:"match_status"`
+	MatchMode         SampleMatchMode       `json:"match_mode,omitempty"`
+	AutoMatchEnabled  bool                  `json:"auto_match_enabled"`
+	Remark            string                `json:"remark"`
+	ClinicalDiagnosis ClinicalDiagnosisInfo `json:"clinical_diagnosis"`
+	SubmissionInfo    SubmissionInfo        `json:"submission_info"`
+	ProjectInfo       ProjectInfo           `json:"project_info"`
+	FamilyHistory     FamilyHistoryInfo     `json:"family_history"`
+	AnalysisTasks     []AnalysisTaskBrief   `json:"analysis_tasks"`
+	CreatedAt         string                `json:"created_at"`
+	UpdatedAt         string                `json:"updated_at"`
+}
+
+// AnalysisTaskBrief is a brief task reference in sample detail
+type AnalysisTaskBrief struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Status    string `json:"status"`
+	CreatedAt string `json:"created_at"`
+}
+
+// SampleCreateRequest is the request body for creating a sample
+type SampleCreateRequest struct {
+	SampleParentUpdate
+
+	IdentityPolicyAcknowledged bool               `json:"identity_policy_acknowledged"`
+	IdentityPolicyVersion      string             `json:"identity_policy_version"`
+	InternalID                 string             `json:"internal_id" binding:"required"`
+	Gender                     SampleGender       `json:"gender"`
+	Age                        *int               `json:"age"`
+	SampleType                 SampleTypeFrontend `json:"sample_type"`
+	Batch                      string             `json:"batch"`
+	ClinicalDiagnosis          string             `json:"clinical_diagnosis"`
+	HPOTerms                   []HPOTerm          `json:"hpo_terms"`
+	R1Path                     string             `json:"r1_path"`
+	R2Path                     string             `json:"r2_path"`
+	Remark                     string             `json:"remark"`
+}
+
+// SampleUpdateRequest is the request body for updating a sample
+type SampleUpdateRequest struct {
+	SampleParentUpdate
+
+	InternalID        string             `json:"internal_id"`
+	Gender            SampleGender       `json:"gender"`
+	Age               *int               `json:"age"`
+	SampleType        SampleTypeFrontend `json:"sample_type"`
+	Batch             string             `json:"batch"`
+	ClinicalDiagnosis string             `json:"clinical_diagnosis"`
+	HPOTerms          []HPOTerm          `json:"hpo_terms"`
+	R1Path            string             `json:"r1_path"`
+	R2Path            string             `json:"r2_path"`
+	Remark            string             `json:"remark"`
+	Status            SampleStatus       `json:"status"`
+}
+
+// SampleMatchUploadJobRequest binds a completed paired FASTQ upload job to a sample.
+type SampleMatchUploadJobRequest struct {
+	UploadJobID string `json:"upload_job_id" binding:"required"`
+}
+
+type SampleDataLinkRequest struct {
+	Read1AssetID string `json:"read1_asset_id" binding:"required"`
+	Read2AssetID string `json:"read2_asset_id" binding:"required"`
+}
+
+// SampleListQuery is the query parameters for listing samples
+type SampleListQuery struct {
+	AnalysisType string `form:"analysis_type"`
+
+	Page           int                `form:"page" binding:"omitempty,min=1"`
+	PageSize       int                `form:"page_size" binding:"omitempty,min=1,max=100"`
+	Search         string             `form:"search"`
+	Status         SampleStatus       `form:"status"`
+	SampleType     SampleTypeFrontend `form:"sample_type"`
+	ProjectID      uint               `form:"project_id"`
+	CreatedBy      uint               `json:"-" form:"-"`
+	OrgID          string             `json:"-" form:"-"`
+	IncludeAll     bool               `json:"-" form:"-"`
+	SharedInstance bool               `json:"-" form:"-"`
+}
+
+// SampleListResponse is the response for listing samples
+type SampleListResponse struct {
+	Total int64            `json:"total"`
+	Items []SampleResponse `json:"items"`
+}
+
+// TableName specifies the table name for Sample
+func (Sample) TableName() string {
+	return "samples"
+}
+
+func (s *Sample) GetClinicalDiagnosis() string {
+	if strings.TrimSpace(s.ClinicalDiagnosis) == "" {
+		return ""
+	}
+	var info ClinicalDiagnosisInfo
+	if err := json.Unmarshal([]byte(s.ClinicalDiagnosis), &info); err == nil {
+		return info.MainDiagnosis
+	}
+	return s.ClinicalDiagnosis
+}
+
+func (s *Sample) SetClinicalDiagnosis(value string) {
+	b, _ := json.Marshal(ClinicalDiagnosisInfo{MainDiagnosis: value})
+	s.ClinicalDiagnosis = string(b)
+}
+
+// GetHPOTerms parses HPOTerms JSON
+func (s *Sample) GetHPOTerms() []HPOTerm {
+	if s.HPOTerms == "" {
+		return []HPOTerm{}
+	}
+	var terms []HPOTerm
+	json.Unmarshal([]byte(s.HPOTerms), &terms)
+	return terms
+}
+
+// SetHPOTerms sets HPOTerms JSON
+func (s *Sample) SetHPOTerms(terms []HPOTerm) {
+	b, _ := json.Marshal(terms)
+	s.HPOTerms = string(b)
+}
+
+func parseMatchedPair(value string) *MatchedPair {
+	if value = strings.TrimSpace(value); value == "" || value == "null" || value == "{}" {
+		return nil
+	}
+	var mp MatchedPair
+	if err := json.Unmarshal([]byte(value), &mp); err != nil {
+		return nil
+	}
+	return &mp
+}
+
+// GetMatchedPair returns the effective pair. Explicit manual selection always
+// takes precedence over the independently maintained automatic match.
+func (s *Sample) GetMatchedPair() *MatchedPair {
+	if pair := s.GetManualMatchedPair(); pair != nil {
+		return pair
+	}
+	if pair := s.GetAutoMatchedPair(); pair != nil {
+		return pair
+	}
+	if strings.TrimSpace(s.ManualMatchedPair) == "" && strings.TrimSpace(s.AutoMatchedPair) == "" {
+		return parseMatchedPair(s.MatchedPair)
+	}
+	return nil
+}
+
+func (s *Sample) GetAutoMatchedPair() *MatchedPair {
+	return parseMatchedPair(s.AutoMatchedPair)
+}
+
+func (s *Sample) GetManualMatchedPair() *MatchedPair {
+	return parseMatchedPair(s.ManualMatchedPair)
+}
+
+// PublicMatchedPair keeps storage paths private while preserving the legacy
+// response shape consumed by clients that only need readiness and filenames.
+func (s *Sample) PublicMatchedPair() *MatchedPair {
+	pair := s.GetMatchedPair()
+	if pair == nil {
+		return nil
+	}
+	return &MatchedPair{
+		R1Path: path.Base(strings.ReplaceAll(pair.R1Path, `\`, "/")),
+		R2Path: path.Base(strings.ReplaceAll(pair.R2Path, `\`, "/")),
+	}
+}
+
+func marshalMatchedPair(mp *MatchedPair) string {
+	if mp == nil {
+		return "null"
+	}
+	b, _ := json.Marshal(mp)
+	return string(b)
+}
+
+// SetMatchedPair is the compatibility setter for explicit/manual matches.
+func (s *Sample) SetMatchedPair(mp *MatchedPair) {
+	s.SetManualMatchedPair(mp)
+	s.MatchedPair = marshalMatchedPair(mp)
+}
+
+func (s *Sample) SetAutoMatchedPair(mp *MatchedPair) {
+	s.AutoMatchedPair = marshalMatchedPair(mp)
+}
+
+func (s *Sample) SetManualMatchedPair(mp *MatchedPair) {
+	s.ManualMatchedPair = marshalMatchedPair(mp)
+}
+
+// GetSubmissionInfo parses SubmissionInfo JSON
+func (s *Sample) GetSubmissionInfo() SubmissionInfo {
+	if s.SubmissionInfo == "" {
+		return SubmissionInfo{}
+	}
+	var info SubmissionInfo
+	json.Unmarshal([]byte(s.SubmissionInfo), &info)
+	return info
+}
+
+// SetSubmissionInfo sets SubmissionInfo JSON
+func (s *Sample) SetSubmissionInfo(info SubmissionInfo) {
+	b, _ := json.Marshal(info)
+	s.SubmissionInfo = string(b)
+}
+
+// GetProjectInfo parses ProjectInfo JSON
+func (s *Sample) GetProjectInfo() ProjectInfo {
+	if s.ProjectInfo == "" {
+		return ProjectInfo{}
+	}
+	var info ProjectInfo
+	json.Unmarshal([]byte(s.ProjectInfo), &info)
+	return info
+}
+
+// SetProjectInfo sets ProjectInfo JSON
+func (s *Sample) SetProjectInfo(info ProjectInfo) {
+	b, _ := json.Marshal(info)
+	s.ProjectInfo = string(b)
+}
+
+// GetFamilyHistory parses FamilyHistory JSON
+func (s *Sample) GetFamilyHistory() FamilyHistoryInfo {
+	if s.FamilyHistory == "" {
+		return FamilyHistoryInfo{}
+	}
+	var info FamilyHistoryInfo
+	json.Unmarshal([]byte(s.FamilyHistory), &info)
+	return info
+}
+
+// SetFamilyHistory sets FamilyHistory JSON
+func (s *Sample) SetFamilyHistory(info FamilyHistoryInfo) {
+	b, _ := json.Marshal(info)
+	s.FamilyHistory = string(b)
+}
+
+// SampleToResponse converts Sample to SampleResponse
+func SampleToResponse(s *Sample) SampleResponse {
+	return SampleResponse{ExpiresAt: s.ExpiresAt, SampleParents: s.SampleParents,
+		ID:                s.UUID,
+		InternalID:        s.InternalID,
+		Gender:            s.Gender,
+		Age:               s.Age,
+		SampleType:        s.SampleType,
+		Batch:             s.Batch,
+		ClinicalDiagnosis: s.GetClinicalDiagnosis(),
+		HPOTerms:          s.GetHPOTerms(),
+		MatchedPair:       s.PublicMatchedPair(),
+		MatchStatus:       s.MatchStatus,
+		MatchMode:         s.MatchMode,
+		AutoMatchEnabled:  s.AutoMatchEnabled,
+		Remark:            s.Remark,
+		Status:            s.Status,
+		CreatedAt:         s.CreatedAt.Format(time.RFC3339),
+		UpdatedAt:         s.UpdatedAt.Format(time.RFC3339),
+	}
+}
+
+// FormatID converts uint to string
+func FormatID(id uint) string {
+	return strconv.FormatUint(uint64(id), 10)
+}

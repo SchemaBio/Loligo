@@ -1,0 +1,461 @@
+package router
+
+import (
+	"fmt"
+	"net/http"
+	"time"
+
+	"github.com/SchemaBio/Loligo/internal/config"
+	"github.com/SchemaBio/Loligo/internal/handler"
+	"github.com/SchemaBio/Loligo/internal/middleware"
+
+	"github.com/gin-gonic/gin"
+)
+
+// redirectAuthLegacy issues a 308 Permanent Redirect to the new /auth/* path.
+// 308 preserves the request method and body for legacy POST clients.
+func redirectAuthLegacy(target string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Redirect(http.StatusPermanentRedirect, target)
+	}
+}
+
+func New(cfg *config.Config) *gin.Engine {
+	gin.SetMode(cfg.Server.Mode)
+
+	r := gin.New()
+	if err := r.SetTrustedProxies(cfg.Server.TrustedProxies); err != nil {
+		// ValidateStartup normally catches this. Keep router construction
+		// fail-closed for tests and embedders that bypass startup validation.
+		panic(fmt.Sprintf("invalid trusted proxy configuration: %v", err))
+	}
+	r.Use(middleware.Logger())
+	r.Use(middleware.Recovery())
+	r.Use(middleware.CORS(&cfg.Server))
+	r.Use(middleware.CSRF())
+	r.Use(middleware.ResearchPolicy(cfg))
+
+	// Health check (public)
+	r.GET("/health", handler.HealthCheck)
+
+	// API v1
+	v1 := r.Group("/api/v1")
+	{
+		// ========== Authentication (public) ==========
+		publicRateLimit := middleware.IPRateLimit(60, time.Minute)
+		authHandler := handler.NewAuthHandler(cfg)
+		auth := v1.Group("/auth")
+		auth.Use(publicRateLimit)
+		{
+			auth.POST("/login", authHandler.Login)
+			auth.POST("/register", authHandler.Register)
+			auth.POST("/refresh", authHandler.Refresh)
+			auth.POST("/logout", authHandler.Logout)
+			auth.POST("/forgot-password", authHandler.ForgotPassword)
+			auth.POST("/reset-password", authHandler.ResetPassword)
+		}
+
+		// Legacy auth routes (pre-/auth/ prefix) kept for older deploy scripts.
+		v1.POST("/login", redirectAuthLegacy("/api/v1/auth/login"))
+		v1.POST("/register", redirectAuthLegacy("/api/v1/auth/register"))
+		v1.POST("/refresh", redirectAuthLegacy("/api/v1/auth/refresh"))
+		v1.POST("/logout", redirectAuthLegacy("/api/v1/auth/logout"))
+		v1.POST("/forgot-password", redirectAuthLegacy("/api/v1/auth/forgot-password"))
+		v1.POST("/reset-password", redirectAuthLegacy("/api/v1/auth/reset-password"))
+
+		// Protected auth routes
+		authProtected := v1.Group("/auth")
+		authProtected.Use(middleware.JWTAuth(cfg))
+		{
+			authProtected.GET("/me", authHandler.Me)
+			authProtected.PUT("/me", authHandler.UpdateMe)
+			authProtected.POST("/password", authHandler.ChangePassword)
+			authProtected.DELETE("/me", authHandler.DeleteMe)
+		}
+
+		// ========== User management ==========
+		userHandler := handler.NewUserHandler(cfg)
+		users := v1.Group("/users")
+		users.Use(middleware.JWTAuth(cfg))
+		users.Use(middleware.RequireAdmin())
+		{
+			users.GET("", userHandler.ListUsers)
+			users.GET("/pending", userHandler.ListPendingUsers)
+			users.GET("/:id", userHandler.GetUser)
+		}
+		// Admin-only user management
+		usersAdmin := v1.Group("/users")
+		usersAdmin.Use(middleware.JWTAuth(cfg))
+		usersAdmin.Use(middleware.RequireAdmin())
+		{
+			usersAdmin.POST("", userHandler.CreateUser)
+			usersAdmin.POST("/:id/approve", userHandler.ApproveUser)
+			usersAdmin.POST("/:id/reject", userHandler.RejectUser)
+			usersAdmin.PUT("/:id", userHandler.UpdateUser)
+			usersAdmin.DELETE("/:id", userHandler.DeleteUser)
+		}
+
+		// ========== WDL templates (protected read) ==========
+		// Catalog defaults include internal reference-resource paths and must not
+		// be exposed as an unauthenticated deployment fingerprint.
+		templates := v1.Group("/templates")
+		templates.Use(middleware.JWTAuth(cfg))
+		{
+			templates.GET("", handler.ListTemplates)
+			templates.GET("/:name", handler.GetTemplate)
+			templates.GET("/:name/inputs", handler.GetTemplateInputs)
+		}
+
+		workflowConfigHandler := handler.NewWorkflowConfigHandler()
+		workflowConfig := v1.Group("/admin/workflow-configs")
+		workflowConfig.Use(middleware.JWTAuth(cfg))
+		workflowConfig.Use(middleware.RequireAdminInSaaS(cfg))
+		{
+			workflowConfig.GET("", workflowConfigHandler.List)
+			workflowConfig.PUT("/:template/:genome", workflowConfigHandler.Update)
+		}
+
+		// Bounded cross-tenant aggregates for Rossia. The handler enforces
+		// the 100-tenant request limit and is reachable through Onykia's explicit
+		// Loligo proxy allowlist.
+		tenantStatsHandler := handler.NewAdminTenantStatsHandler()
+		tenantStats := v1.Group("/admin/tenant-stats")
+		tenantStats.Use(middleware.JWTAuth(cfg))
+		tenantStats.Use(middleware.RequireAdmin())
+		{
+			tenantStats.GET("", tenantStatsHandler.GetTenantStats)
+		}
+
+		// ========== Sepiida integration ==========
+		sepiidaHandler := handler.NewSepiidaHandler(cfg)
+		sepiida := v1.Group("/sepiida")
+		sepiida.Use(middleware.JWTAuth(cfg))
+		{
+			sepiida.GET("/health", sepiidaHandler.HealthCheck)
+		}
+		// Admin-only sepiida workflows
+		sepiidaAdmin := v1.Group("/sepiida")
+		sepiidaAdmin.Use(middleware.JWTAuth(cfg))
+		sepiidaAdmin.Use(middleware.RequireAdmin())
+		{
+			sepiidaAdmin.GET("/workflows", sepiidaHandler.ListWorkflows)
+		}
+
+		// ========== Task management (protected) ==========
+		taskHandler := handler.NewTaskHandler(cfg)
+		assistanceHandler := handler.NewAIAssistanceHandler(cfg)
+		assistance := v1.Group("/ai-assistance", middleware.JWTAuth(cfg))
+		assistance.GET("/settings", assistanceHandler.Settings)
+		assistance.POST("/hpo-cache", assistanceHandler.CachedHPO)
+		assistance.PUT("/settings", middleware.RequireAdmin(), middleware.IPRateLimit(10, time.Minute), assistanceHandler.SaveSettings)
+		assistance.POST("/settings/test", middleware.RequireAdmin(), middleware.IPRateLimit(3, time.Minute), assistanceHandler.TestProvider)
+		assistance.POST("/requests", middleware.IPRateLimit(30, time.Minute), assistanceHandler.DecodeInput, taskHandler.InterpretationEditGuard, assistanceHandler.Generate)
+		assistance.GET("/requests/:requestID", assistanceHandler.Get)
+		assistance.DELETE("/requests/:requestID", assistanceHandler.DeleteResult)
+		assistance.POST("/requests/:requestID/cancel", assistanceHandler.Cancel)
+		v1.POST("/internal/cvm/events", taskHandler.CVMStateEvent)
+		v1.POST("/internal/cvm/inputs/refresh", taskHandler.CVMInputRefresh)
+		storageHandler := handler.NewStorageHandler(cfg)
+		v1.POST("/internal/storage/tenants", middleware.IPRateLimit(120, time.Minute), storageHandler.InitializeTenant)
+		aiHandler := handler.NewAIHandler(cfg)
+		exportHandler := handler.NewExportHandler(cfg)
+		resultDownloadHandler := handler.NewResultDownloadHandler(cfg)
+		reportHandler := handler.NewReportHandler(cfg)
+		resultPackageHandler := handler.NewResultPackageHandler(cfg)
+		tasks := v1.Group("/tasks")
+		tasks.Use(middleware.JWTAuth(cfg), taskHandler.InterpretationEditGuard)
+		{
+			tasks.POST("", taskHandler.CreateTask)
+			tasks.POST("/estimate", taskHandler.EstimateTask)
+			tasks.POST("/batch/preview", taskHandler.PreviewTaskBatch)
+			tasks.POST("/batch", taskHandler.CreateTaskBatch)
+			tasks.GET("", taskHandler.ListTasks)
+			tasks.GET("/audit", taskHandler.ListTasksAudit)
+			tasks.GET("/stats", taskHandler.GetTaskStats)
+			tasks.GET("/:id", taskHandler.GetTask)
+			tasks.PUT("/:id", taskHandler.UpdateTask)
+			tasks.PUT("/:id/interpretation-completion", taskHandler.SetInterpretationCompleted)
+			tasks.GET("/:id/progress", taskHandler.GetTaskProgress)
+			tasks.DELETE("/:id", taskHandler.DeleteTask)
+			tasks.GET("/:id/logs", taskHandler.GetTaskLogs)
+			tasks.GET("/:id/sample", taskHandler.GetTaskSample)
+			tasks.POST("/:id/start", taskHandler.StartTask)
+			tasks.POST("/:id/stop", taskHandler.StopTask)
+			tasks.POST("/:id/retry", taskHandler.RetryTask)
+			tasks.POST("/:id/results/import/retry", taskHandler.RetryResultImport)
+			tasks.POST("/:id/ai-evaluate", aiHandler.Evaluate)
+			tasks.POST("/:id/result-package/prepare", resultPackageHandler.Prepare)
+			tasks.GET("/:id/result-package", resultPackageHandler.Status)
+
+			// AI proxy for frontend page-agent.
+			aiProxy := v1.Group("/ai/proxy")
+			aiProxy.Use(middleware.JWTAuth(cfg))
+			{
+				aiProxy.Any("/*path", aiHandler.ProxyAgent)
+			}
+			// Charged raw downloads: quotes never deduct credits.
+			tasks.GET("/:id/downloads", resultDownloadHandler.Catalog)
+			tasks.GET("/:id/downloads/active", resultDownloadHandler.Active)
+			tasks.GET("/:id/downloads/files/:file", resultDownloadHandler.SelfHostedFile)
+			tasks.POST("/:id/downloads/prepare", resultDownloadHandler.Catalog)
+			tasks.POST("/:id/downloads/quote", resultDownloadHandler.Quote)
+			tasks.POST("/:id/downloads/issue", resultDownloadHandler.Issue)
+			tasks.GET("/:id/downloads/:grant/file", resultDownloadHandler.File)
+
+			// Export
+			tasks.GET("/:id/export/excel", exportHandler.ExportExcel)
+			tasks.GET("/:id/export/parquet", exportHandler.ExportParquet)
+			tasks.GET("/:id/export/vcf", exportHandler.ExportVCF)
+			tasks.GET("/:id/export/mt-vcf", exportHandler.ExportMTVCF)
+			// Reports
+			tasks.GET("/:id/reports", reportHandler.ListReports)
+			tasks.POST("/:id/reports", reportHandler.CreateReport)
+			tasks.GET("/:id/report-generations", reportHandler.Generations)
+			tasks.GET("/:id/report-preview", reportHandler.Preview)
+			tasks.POST("/:id/reports/upload", reportHandler.UploadReport)
+			tasks.PATCH("/:id/reports/:reportId/status", reportHandler.UpdateReportStatus)
+			tasks.DELETE("/:id/reports/:reportId", reportHandler.DeleteReport)
+			tasks.GET("/:id/reports/:reportId/download-url", reportHandler.GetReportDownloadURL)
+		}
+
+		// ========== Report templates ==========
+		reportTemplates := v1.Group("/report-templates")
+		reportTemplates.Use(middleware.JWTAuth(cfg))
+		{
+			reportTemplates.GET("", reportHandler.ListTemplates)
+			reportTemplates.POST("", reportHandler.CreateTemplate)
+			reportTemplates.POST("/validate-endpoint", reportHandler.ValidateTemplateEndpoint)
+			reportTemplates.PUT("/:id", reportHandler.UpdateTemplate)
+			reportTemplates.PUT("/:id/status", reportHandler.UpdateTemplateStatus)
+			reportTemplates.DELETE("/:id", reportHandler.DeleteTemplate)
+		}
+
+		// ========== Result management (protected) ==========
+		resultHandler := handler.NewResultHandler(cfg)
+		results := v1.Group("/tasks/:id/results")
+		results.Use(middleware.JWTAuth(cfg), taskHandler.InterpretationEditGuard)
+		{
+			results.GET("/context", resultHandler.GetContext)
+			results.GET("/tables/:table/browser/file", resultHandler.GetLocalBrowserFile)
+			results.GET("/igv", resultHandler.GetIGVSession)
+			results.GET("/igv/snapshot", resultHandler.GetIGVSnapshot)
+			results.GET("/igv/snapshot/file", resultHandler.GetLocalIGVSnapshotFile)
+			results.POST("/igv/snapshot", resultHandler.SaveIGVSnapshot)
+			results.GET("/igv/reference/:asset", resultHandler.GetIGVReference)
+			results.GET("/igv/tracks/:track/:asset", resultHandler.GetLocalIGVTrack)
+			results.POST("/igv/urls", resultHandler.SignIGVTrackURLs)
+			results.GET("/qc", resultHandler.GetQC)
+			results.GET("/snv-indel", resultHandler.ListSNVIndels)
+			results.POST("/tables/:table/query", resultHandler.QueryParquetTable)
+			results.GET("/tables/:table/browser", resultHandler.GetBrowserDataset)
+			results.GET("/assessment/context", resultHandler.GetAssessmentContext)
+			results.GET("/assessment/svcv4/schema", resultHandler.GetSVCv4Schema)
+			results.POST("/assessment/svcv4/evaluate", resultHandler.EvaluateSVCv4)
+			results.POST("/assessment/context", resultHandler.ActivateAssessmentContext)
+			results.GET("/tables/:table/adjustments", resultHandler.GetBrowserAdjustments)
+			results.GET("/tables/:table/views", resultHandler.ListPersonalViews)
+			results.PUT("/tables/:table/views", resultHandler.SavePersonalView)
+			results.POST("/tables/:table/export", resultHandler.ExportParquetTable)
+			results.GET("/rows/:table/:vid", resultHandler.GetParquetRowAdjustment)
+			results.GET("/rows/:table/:vid/history", resultHandler.ListParquetRowHistory)
+			results.PUT("/rows/:table/:vid", resultHandler.SaveParquetRowAdjustment)
+			results.PUT("/rows/:table/:vid/focus", resultHandler.SaveParquetRowAdjustment)
+			results.GET("/cnv-segment", resultHandler.ListCNVSegments)
+			results.GET("/cnv-exon", resultHandler.ListCNVExons)
+			results.GET("/str", resultHandler.ListSTRs)
+			results.GET("/mei", resultHandler.ListMEIs)
+			results.GET("/mt", resultHandler.ListMTVariants)
+			results.GET("/upd", resultHandler.ListUPDRegions)
+			results.GET("/roh", resultHandler.ListROHRegions)
+			results.GET("/cnv-assessments", resultHandler.ListCNVAssessments)
+			results.GET("/cnv-assessments/:type/:vid", resultHandler.GetCNVAssessment)
+			results.PUT("/cnv-assessments/:type/:vid", resultHandler.SaveCNVAssessment)
+			results.GET("/review-events", resultHandler.ListReviewEvents)
+			results.PUT("/:type/:vid/review", resultHandler.ReviewVariant)
+			results.PUT("/:type/:vid/focus", resultHandler.FocusVariant)
+		}
+
+		// ========== Archive management (protected) ==========
+		archiveHandler := handler.NewArchiveHandler(cfg)
+		archive := v1.Group("/archive")
+		archive.Use(middleware.JWTAuth(cfg), taskHandler.InterpretationEditGuard)
+		{
+			archive.GET("/:uuid", archiveHandler.ArchiveStatus)
+			archive.GET("/:uuid/outputs", archiveHandler.ListOutputKeys)
+			archive.GET("/:uuid/output/:key", archiveHandler.QueryOutput)
+			archive.GET("/:uuid/status", archiveHandler.GetStatus)
+			archive.PUT("/:uuid/status", archiveHandler.UpdateStatus)
+			archive.GET("/:uuid/parquet", archiveHandler.GetParquet)
+			archive.GET("/:uuid/data", archiveHandler.GetCombinedData)
+			archive.POST("/:uuid/import", archiveHandler.ImportToDatabase)
+		}
+
+		// ========== Sample management (protected) ==========
+		sampleHandler := handler.NewSampleHandler(cfg)
+		samples := v1.Group("/samples")
+		samples.Use(middleware.JWTAuth(cfg))
+		{
+			samples.POST("", sampleHandler.CreateSample)
+			samples.GET("", sampleHandler.ListSamples)
+			samples.POST("/resolve-parents", sampleHandler.ResolveParents)
+			samples.GET("/:id/trio-context", sampleHandler.TrioContext)
+			samples.GET("/:id", sampleHandler.GetSample)
+			samples.PUT("/:id", sampleHandler.UpdateSample)
+			samples.POST("/:id/matched-pair/upload-job", sampleHandler.MatchFromUploadJob)
+			samples.PUT("/:id/data-link", sampleHandler.LinkDataAssets)
+			samples.GET("/:id/data-link", sampleHandler.GetDataLink)
+			samples.DELETE("/:id/data-link", sampleHandler.ClearMatchedPair)
+			samples.DELETE("/:id/matched-pair", sampleHandler.ClearMatchedPair)
+			samples.DELETE("/:id", sampleHandler.DeleteSample)
+		}
+
+		// ========== Project management (protected) ==========
+		projectHandler := handler.NewProjectHandler(cfg)
+		projects := v1.Group("/projects")
+		projects.Use(middleware.JWTAuth(cfg))
+		{
+			projects.POST("", projectHandler.CreateProject)
+			projects.GET("", projectHandler.ListProjects)
+			projects.GET("/:id", projectHandler.GetProject)
+			projects.GET("/:id/summary", projectHandler.GetProjectSummary)
+			projects.PUT("/:id", projectHandler.UpdateProject)
+			projects.DELETE("/:id", projectHandler.DeleteProject)
+		}
+
+		// ========== Pedigree management (protected) ==========
+		pedigreeHandler := handler.NewPedigreeHandler(cfg)
+		pedigrees := v1.Group("/pedigrees")
+		pedigrees.Use(middleware.JWTAuth(cfg))
+		{
+			pedigrees.POST("", pedigreeHandler.Create)
+			pedigrees.GET("", pedigreeHandler.List)
+			pedigrees.GET("/:id", pedigreeHandler.Get)
+			pedigrees.PUT("/:id", pedigreeHandler.Update)
+			pedigrees.DELETE("/:id", pedigreeHandler.Delete)
+			pedigrees.PUT("/:id/proband/:memberId", pedigreeHandler.SetProband)
+			pedigrees.GET("/:id/members", pedigreeHandler.ListMembers)
+			pedigrees.POST("/:id/members", pedigreeHandler.CreateMember)
+			pedigrees.GET("/:id/members/:memberId", pedigreeHandler.GetMember)
+			pedigrees.PUT("/:id/members/:memberId", pedigreeHandler.UpdateMember)
+			pedigrees.DELETE("/:id/members/:memberId", pedigreeHandler.DeleteMember)
+		}
+
+		// ========== Gene List management (protected) ==========
+		geneListHandler := handler.NewGeneListHandler(cfg)
+		geneLists := v1.Group("/gene-lists")
+		geneLists.Use(middleware.JWTAuth(cfg))
+		{
+			geneLists.POST("", geneListHandler.Create)
+			geneLists.GET("", geneListHandler.List)
+			geneLists.GET("/:id", geneListHandler.Get)
+			geneLists.PUT("/:id", geneListHandler.Update)
+			geneLists.POST("/:id/publish", geneListHandler.Publish)
+			geneLists.DELETE("/:id", geneListHandler.Delete)
+		}
+
+		// ========== Pipeline management (protected) ==========
+		pipelineHandler := handler.NewPipelineHandler(cfg)
+		pipelines := v1.Group("/pipelines")
+		pipelines.Use(middleware.JWTAuth(cfg))
+		{
+			pipelines.POST("", pipelineHandler.CreatePipeline)
+			pipelines.GET("", pipelineHandler.ListPipelines)
+			pipelines.GET("/:id", pipelineHandler.GetPipeline)
+			pipelines.PUT("/:id", pipelineHandler.UpdatePipeline)
+			pipelines.DELETE("/:id", pipelineHandler.DeletePipeline)
+		}
+
+		// ========== Parquet data API (protected) ==========
+		parquetHandler := handler.NewParquetHandler(cfg)
+		parquet := v1.Group("/tasks/:id/parquet")
+		parquet.Use(middleware.JWTAuth(cfg))
+		{
+			parquet.GET("", parquetHandler.ListTables)
+			parquet.GET("/:table/rows", parquetHandler.GetTableRows)
+		}
+
+		// ========== History (protected) ==========
+		historyHandler := handler.NewHistoryHandler(cfg)
+		history := v1.Group("/history")
+		history.Use(middleware.JWTAuth(cfg))
+		{
+			history.GET("/sync", historyHandler.SyncFocuses)
+			history.GET("/focuses/:id", historyHandler.FocusDetail)
+			history.GET("/snv-indel", historyHandler.ListGroupedSNVIndels)
+			history.GET("/cnv-segment", historyHandler.ListGroupedCNVSegments)
+			history.GET("/cnv-exon", historyHandler.ListGroupedCNVExons)
+			history.GET("/str", historyHandler.ListGroupedSTRs)
+			history.GET("/mei", historyHandler.ListGroupedMEIs)
+			history.GET("/mt", historyHandler.ListGroupedMTVariants)
+			history.GET("/upd", historyHandler.ListGroupedUPDRegions)
+		}
+
+		// ========== Dashboard (protected) ==========
+		dashboardHandler := handler.NewDashboardHandler(cfg)
+		dashboard := v1.Group("/dashboard")
+		dashboard.Use(middleware.JWTAuth(cfg))
+		{
+			dashboard.GET("/stats", dashboardHandler.GetStats)
+		}
+
+		// ========== Data Upload (protected) ==========
+		uploadHandler := handler.NewUploadHandler(cfg)
+		uploads := v1.Group("/upload")
+		uploads.Use(middleware.JWTAuth(cfg))
+		{
+			uploads.POST("/jobs", uploadHandler.CreateJob)
+			uploads.GET("/jobs", uploadHandler.ListJobs)
+			uploads.GET("/jobs/:uuid", uploadHandler.GetJob)
+			uploads.DELETE("/jobs/:uuid", uploadHandler.DeleteJob)
+			uploads.POST("/local/:file_uuid", uploadHandler.UploadLocal)
+			uploads.POST("/files/:file_uuid/start", uploadHandler.StartS3)
+			uploads.POST("/files/:file_uuid/complete", uploadHandler.CompleteS3)
+			uploads.POST("/files/:file_uuid/retry", uploadHandler.RetryS3)
+			uploads.POST("/files/:file_uuid/multipart", uploadHandler.InitMultipart)
+			uploads.POST("/files/:file_uuid/multipart/:session_uuid/parts/presign", uploadHandler.PresignMultipartParts)
+			uploads.PUT("/files/:file_uuid/multipart/:session_uuid/parts", uploadHandler.RecordMultipartPart)
+			uploads.POST("/files/:file_uuid/multipart/:session_uuid/complete", uploadHandler.CompleteMultipart)
+			uploads.DELETE("/files/:file_uuid/multipart/:session_uuid", uploadHandler.AbortMultipart)
+			uploads.GET("/files", uploadHandler.ListFiles)
+			uploads.GET("/files/stats", uploadHandler.GetFileStats)
+			uploads.GET("/files/:file_uuid/download", uploadHandler.GetDownloadURL)
+		}
+
+		// ========== Organization data center (protected) ==========
+		dataAssetHandler := handler.NewDataAssetHandler(cfg)
+		data := v1.Group("/data")
+		data.Use(middleware.JWTAuth(cfg))
+		{
+			data.GET("/config", dataAssetHandler.Config)
+			if cfg.Edition == "opensource" {
+				data.POST("/local-import", dataAssetHandler.ImportLocalPair)
+			}
+			data.GET("/assets", dataAssetHandler.List)
+			data.GET("/assets/:uuid", dataAssetHandler.Get)
+			data.POST("/assets/:uuid/validate", dataAssetHandler.ValidateBED)
+			data.PUT("/assets/:uuid", dataAssetHandler.Update)
+			data.GET("/assets/:uuid/download", dataAssetHandler.Download)
+			data.DELETE("/assets/:uuid", dataAssetHandler.Delete)
+		}
+
+		cnvBaselineHandler := handler.NewCNVBaselineHandler(cfg)
+		cnvBaselines := v1.Group("/cnv-baselines")
+		cnvBaselines.Use(middleware.JWTAuth(cfg))
+		{
+			cnvBaselines.POST("", cnvBaselineHandler.Create)
+			cnvBaselines.GET("", cnvBaselineHandler.List)
+			cnvBaselines.GET("/:uuid", cnvBaselineHandler.Get)
+			cnvBaselines.DELETE("/:uuid", cnvBaselineHandler.Delete)
+		}
+
+		// ========== Result import batches (audit, protected) ==========
+		resultImportHandler := handler.NewResultImportHandler(cfg)
+		resultImport := v1.Group("/result-import")
+		resultImport.Use(middleware.JWTAuth(cfg))
+		{
+			resultImport.GET("/batches", resultImportHandler.ListBatches)
+		}
+	}
+
+	return r
+}

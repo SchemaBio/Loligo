@@ -1,0 +1,342 @@
+package middleware
+
+import (
+	"crypto/subtle"
+	"net/http"
+	"strconv"
+	"strings"
+
+	"github.com/SchemaBio/Loligo/internal/config"
+	"github.com/SchemaBio/Loligo/internal/database"
+	"github.com/SchemaBio/Loligo/internal/model"
+	"github.com/SchemaBio/Loligo/internal/repository"
+	"github.com/SchemaBio/Loligo/internal/service"
+	"github.com/gin-gonic/gin"
+)
+
+// mapExternalRole translates trusted-overlay role names (forwarded by Onykia,
+// e.g. PLATFORM_ADMIN / ORG_USER) into Loligo SystemRole values.
+//
+// The overlay is trusted on identity (it proved the shared secret), but role
+// strings are NOT a security boundary — the secret is. Unknown or empty
+// roles therefore collapse to USER (least privilege / fail-closed) rather
+// than escalating: we never map an unrecognized string to SUPER_ADMIN. An
+// already-Loligo-shaped role ("SUPER_ADMIN"/"USER") passes through unchanged.
+const onykiaBreakGlassHeader = "X-Onykia-Break-Glass"
+
+func mapExternalRole(role, breakGlass string) string {
+	normalized := strings.ToUpper(strings.TrimSpace(role))
+	elevated := strings.EqualFold(strings.TrimSpace(breakGlass), "1") || strings.EqualFold(strings.TrimSpace(breakGlass), "true")
+	switch normalized {
+	case "PLATFORM_ADMIN", "PLATFORMADMIN", "SUPER_ADMIN", "SUPERADMIN":
+		if elevated {
+			return string(model.SystemRoleSuperAdmin)
+		}
+		return string(model.SystemRoleUser)
+	case "ORG_USER", "ORGUSER", "USER":
+		return string(model.SystemRoleUser)
+	default:
+		return string(model.SystemRoleUser)
+	}
+}
+
+func applyExternalAuth(c *gin.Context, cfg *config.Config) bool {
+	if cfg == nil || !cfg.ExternalAuth.Enabled || cfg.ExternalAuth.SharedSecret == "" {
+		return false
+	}
+
+	token := bearerToken(c.GetHeader(cfg.ExternalAuth.HeaderName))
+	if token == "" {
+		return false
+	}
+
+	if service.IdentityTokenLooksLike(token) {
+		claims, err := service.ParseIdentityToken(cfg.ExternalAuth.SharedSecret, token)
+		if err != nil {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid external identity token"})
+			c.Abort()
+			return true
+		}
+		c.Set("download_client_ip", claims.ClientIP)
+		c.Set("org_role", claims.OrgRole)
+		applyExternalIdentity(c, claims.UserID, claims.Email, mapExternalRole(claims.Role, boolBreakGlass(claims.BreakGlass)), claims.OrgID, claims.StorageQuotaBytes, true)
+		return true
+	}
+
+	if cfg.Server.Mode == "release" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Signed external identity is required"})
+		c.Abort()
+		return true
+	}
+	if subtle.ConstantTimeCompare([]byte(token), []byte(cfg.ExternalAuth.SharedSecret)) != 1 {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid external auth credentials"})
+		c.Abort()
+		return true
+	}
+
+	userID, err := strconv.ParseUint(strings.TrimSpace(c.GetHeader(cfg.ExternalAuth.UserIDHeader)), 10, 64)
+	if err != nil || userID == 0 {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid external user identity"})
+		c.Abort()
+		return true
+	}
+
+	email := strings.TrimSpace(c.GetHeader(cfg.ExternalAuth.EmailHeader))
+	role := mapExternalRole(c.GetHeader(cfg.ExternalAuth.RoleHeader), c.GetHeader(onykiaBreakGlassHeader))
+	orgID := strings.TrimSpace(c.GetHeader(cfg.ExternalAuth.OrgIDHeader))
+	var quotaBytes int64
+	hasQuota := false
+	storageQuota := strings.TrimSpace(c.GetHeader("X-Loligo-Storage-Quota-Bytes"))
+	if storageQuota != "" {
+		parsed, err := strconv.ParseInt(storageQuota, 10, 64)
+		if err != nil || parsed < 0 {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid external storage quota"})
+			c.Abort()
+			return true
+		}
+		quotaBytes = parsed
+		hasQuota = true
+	}
+	applyExternalIdentity(c, uint(userID), email, role, orgID, quotaBytes, hasQuota)
+	return true
+}
+
+func boolBreakGlass(enabled bool) string {
+	if enabled {
+		return "1"
+	}
+	return ""
+}
+
+func applyExternalIdentity(c *gin.Context, userID uint, email, role, orgID string, quotaBytes int64, hasQuota bool) {
+	c.Set("user_id", userID)
+	c.Set("email", email)
+	c.Set("role", role)
+	if orgID != "" {
+		c.Set("org_id", orgID)
+	}
+	if hasQuota {
+		c.Set("storage_quota_bytes", quotaBytes)
+	}
+	c.Set("external_auth", true)
+}
+
+func bearerToken(header string) string {
+	header = strings.TrimSpace(header)
+	if header == "" {
+		return ""
+	}
+	parts := strings.SplitN(header, " ", 2)
+	if len(parts) == 2 && strings.EqualFold(parts[0], "Bearer") {
+		return strings.TrimSpace(parts[1])
+	}
+	return header
+}
+
+// JWTAuth middleware validates JWT token (from header or cookie)
+func JWTAuth(cfg *config.Config) gin.HandlerFunc {
+	jwtService := service.NewJWTService(cfg)
+	userRepo := repository.NewUserRepository()
+
+	return func(c *gin.Context) {
+		if applyExternalAuth(c, cfg) {
+			if !enforceBusinessPermissions(c, cfg) {
+				return
+			}
+			c.Next()
+			return
+		}
+
+		tokenString := ""
+
+		// Try Authorization header first
+		authHeader := c.GetHeader("Authorization")
+		if authHeader != "" {
+			parts := strings.SplitN(authHeader, " ", 2)
+			if len(parts) == 2 && parts[0] == "Bearer" {
+				tokenString = parts[1]
+			}
+		}
+
+		// Fall back to cookie
+		if tokenString == "" {
+			cookie, err := c.Cookie("access_token")
+			if err == nil && cookie != "" {
+				tokenString = cookie
+			}
+		}
+
+		if tokenString == "" {
+			c.JSON(http.StatusUnauthorized, gin.H{
+				"error": "Authorization token is required",
+			})
+			c.Abort()
+			return
+		}
+
+		// Validate token
+		claims, err := jwtService.ValidateAccessToken(tokenString)
+		if err != nil {
+			c.JSON(http.StatusUnauthorized, gin.H{
+				"error": "Invalid or expired token",
+			})
+			c.Abort()
+			return
+		}
+
+		// Verify user still exists and is active (skip if DB unavailable)
+		if database.GetDB() != nil {
+			user, err := userRepo.FindByID(claims.UserID)
+			if err != nil || !claimsMatchUser(claims, user) {
+				c.JSON(http.StatusUnauthorized, gin.H{
+					"error": "Account is not active",
+				})
+				c.Abort()
+				return
+			}
+		}
+
+		// Set user info in context
+		c.Set("user_id", claims.UserID)
+		c.Set("email", claims.Email)
+		c.Set("role", claims.Role)
+
+		if !enforceBusinessPermissions(c, cfg) {
+			return
+		}
+		c.Next()
+	}
+}
+
+// OptionalJWTAuth middleware that allows both authenticated and anonymous requests
+func OptionalJWTAuth(cfg *config.Config) gin.HandlerFunc {
+	jwtService := service.NewJWTService(cfg)
+	userRepo := repository.NewUserRepository()
+
+	return func(c *gin.Context) {
+		if applyExternalAuth(c, cfg) {
+			c.Next()
+			return
+		}
+
+		tokenString := ""
+
+		// Try Authorization header first
+		authHeader := c.GetHeader("Authorization")
+		if authHeader != "" {
+			parts := strings.SplitN(authHeader, " ", 2)
+			if len(parts) == 2 && parts[0] == "Bearer" {
+				tokenString = parts[1]
+			}
+		}
+
+		// Fall back to cookie
+		if tokenString == "" {
+			cookie, err := c.Cookie("access_token")
+			if err == nil && cookie != "" {
+				tokenString = cookie
+			}
+		}
+
+		if tokenString == "" {
+			c.Next()
+			return
+		}
+
+		claims, err := jwtService.ValidateAccessToken(tokenString)
+		if err != nil {
+			c.Next()
+			return
+		}
+
+		// Verify user still exists and is active (skip if DB unavailable)
+		if database.GetDB() != nil {
+			user, err := userRepo.FindByID(claims.UserID)
+			if err != nil || !claimsMatchUser(claims, user) {
+				c.Next()
+				return
+			}
+		}
+
+		// Set user info in context
+		c.Set("user_id", claims.UserID)
+		c.Set("email", claims.Email)
+		c.Set("role", claims.Role)
+
+		c.Next()
+	}
+}
+
+// claimsMatchUser verifies that JWT claims still match the database user state.
+func claimsMatchUser(claims *service.Claims, user *model.User) bool {
+	if claims.TokenVersion <= 0 {
+		return false
+	}
+	return user.Email == claims.Email &&
+		string(user.SystemRole) == claims.Role &&
+		user.IsActive &&
+		claims.TokenVersion == service.EffectiveTokenVersion(user.TokenVersion)
+}
+
+// RequireAdmin checks if user has admin role
+func RequireAdmin() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		role, exists := c.Get("role")
+		roleString, ok := role.(string)
+		if !exists || !ok || roleString != string(model.SystemRoleSuperAdmin) {
+			c.JSON(http.StatusForbidden, gin.H{
+				"error": "Admin access required",
+			})
+			c.Abort()
+			return
+		}
+
+		c.Next()
+	}
+}
+
+// GetCurrentUser gets current user info from context
+// Returns: userID, email, role, ok
+func GetCurrentUser(c *gin.Context) (uint, string, string, bool) {
+	userID, exists := c.Get("user_id")
+	if !exists {
+		return 0, "", "", false
+	}
+	email, _ := c.Get("email")
+	role, _ := c.Get("role")
+	userIDValue, ok := userID.(uint)
+	if !ok {
+		return 0, "", "", false
+	}
+	emailValue, ok := email.(string)
+	if !ok {
+		return 0, "", "", false
+	}
+	roleValue, ok := role.(string)
+	if !ok {
+		return 0, "", "", false
+	}
+
+	return userIDValue, emailValue, roleValue, true
+}
+
+// GetCurrentOrg gets the optional organization ID forwarded by a trusted overlay.
+func GetCurrentOrg(c *gin.Context) (string, bool) {
+	orgID, exists := c.Get("org_id")
+	if !exists {
+		return "", false
+	}
+	value, ok := orgID.(string)
+	return value, ok && value != ""
+}
+
+// GetCurrentStorageQuotaBytes returns the storage quota supplied by a trusted
+// SaaS gateway. The value is absent for self-hosted authentication.
+func GetCurrentStorageQuotaBytes(c *gin.Context) (int64, bool) {
+	value, exists := c.Get("storage_quota_bytes")
+	if !exists {
+		return 0, false
+	}
+	quota, ok := value.(int64)
+	return quota, ok && quota >= 0
+}

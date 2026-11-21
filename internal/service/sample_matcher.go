@@ -1,0 +1,210 @@
+package service
+
+import (
+	"context"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"time"
+
+	"github.com/SchemaBio/Loligo/internal/config"
+	"github.com/SchemaBio/Loligo/internal/database"
+	"github.com/SchemaBio/Loligo/internal/model"
+	"github.com/SchemaBio/Loligo/internal/repository"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+)
+
+var fastqPairPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)^(.+?)(?:_S[0-9]+)?(?:_L[0-9]{3})?_R([12])(?:_[0-9]{3})?$`),
+	regexp.MustCompile(`(?i)^(.+?)[._-]([12])$`),
+}
+
+var uploadUUIDPrefix = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}_(.+)$`)
+
+type SampleMatcher struct {
+	shared  bool
+	samples *repository.SampleRepository
+	assets  *repository.DataAssetRepository
+}
+
+func NewSampleMatcher(configs ...*config.Config) *SampleMatcher {
+	shared := len(configs) > 0 && configs[0] != nil && configs[0].Edition == "opensource"
+	return &SampleMatcher{shared: shared, samples: repository.NewSampleRepository(), assets: repository.NewDataAssetRepository()}
+}
+
+func (m *SampleMatcher) Start(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		interval = time.Minute
+	}
+	go func() {
+		m.run(ctx)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				m.run(ctx)
+			}
+		}
+	}()
+}
+
+func (m *SampleMatcher) run(ctx context.Context) {
+	samples, err := m.samples.FindAutoMatchable(500)
+	if err != nil {
+		return
+	}
+	for i := range samples {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		m.matchSample(ctx, &samples[i])
+	}
+}
+
+func (m *SampleMatcher) matchSample(ctx context.Context, sample *model.Sample) {
+	if m.shared && sample.ExternalOrgID != "" {
+		return
+	}
+	assets, err := m.assets.FindCompletedByScope(sample.ExternalOrgID, sample.CreatedBy, m.shared)
+	if err != nil {
+		return
+	}
+	read1, read2, matchRule := selectMatchCandidates(assets, sample.InternalID)
+	switch {
+	case len(read1) == 1 && len(read2) == 1:
+		_ = m.autoLink(sample.ID, &read1[0], &read2[0], matchRule)
+	case len(read1) > 1 || len(read2) > 1:
+		m.clearAutoMatch(sample.ID, model.SampleMatchConflict)
+	case len(read1)+len(read2) > 0:
+		m.clearAutoMatch(sample.ID, model.SampleMatchPartial)
+	case sample.GetAutoMatchedPair() != nil:
+		m.clearAutoMatch(sample.ID, model.SampleMatchMissing)
+	default:
+		m.clearAutoMatch(sample.ID, model.SampleMatchUnmatched)
+	}
+}
+
+func selectMatchCandidates(assets []model.DataAsset, sampleInternalID string) (read1, read2 []model.DataAsset, matchRule string) {
+	var explicitRead1, explicitRead2, filenameRead1, filenameRead2 []model.DataAsset
+	for i := range assets {
+		internalID := strings.TrimSpace(assets[i].InternalID)
+		if internalID != "" {
+			if strings.EqualFold(internalID, strings.TrimSpace(sampleInternalID)) {
+				if assets[i].ReadType == model.ReadTypeRead1 {
+					explicitRead1 = append(explicitRead1, assets[i])
+				}
+				if assets[i].ReadType == model.ReadTypeRead2 {
+					explicitRead2 = append(explicitRead2, assets[i])
+				}
+			}
+			continue
+		}
+		key, readType, ok := parseFASTQPairName(assets[i].FileName)
+		if !ok || !strings.EqualFold(strings.TrimSpace(key), strings.TrimSpace(sampleInternalID)) {
+			continue
+		}
+		if readType == model.ReadTypeRead1 && assets[i].ReadType == model.ReadTypeRead1 {
+			filenameRead1 = append(filenameRead1, assets[i])
+		}
+		if readType == model.ReadTypeRead2 && assets[i].ReadType == model.ReadTypeRead2 {
+			filenameRead2 = append(filenameRead2, assets[i])
+		}
+	}
+	read1, read2 = filenameRead1, filenameRead2
+	matchRule = "filename_internal_id_exact"
+	if len(explicitRead1)+len(explicitRead2) > 0 {
+		read1, read2 = explicitRead1, explicitRead2
+		matchRule = "data_asset_internal_id_exact"
+	}
+	return read1, read2, matchRule
+}
+
+func (m *SampleMatcher) autoLink(sampleID uint, read1, read2 *model.DataAsset, matchRule string) error {
+	return database.GetDB().Transaction(func(tx *gorm.DB) error {
+		var sample model.Sample
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&sample, sampleID).Error; err != nil {
+			return err
+		}
+		if !sample.AutoMatchEnabled {
+			return nil
+		}
+		now := time.Now()
+		link := model.SampleDataLink{
+			SampleID: sample.ID, ExternalOrgID: sample.ExternalOrgID,
+			Read1AssetID: read1.ID, Read2AssetID: read2.ID,
+			MatchMode: model.SampleMatchModeAutomatic, MatchRule: matchRule,
+			MatchedAt: now,
+		}
+		if err := tx.Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "sample_id"}, {Name: "match_mode"}},
+			DoUpdates: clause.AssignmentColumns([]string{"external_org_id", "read1_asset_id", "read2_asset_id", "match_mode", "match_rule", "matched_by", "matched_at", "updated_at"}),
+		}).Create(&link).Error; err != nil {
+			return err
+		}
+		sample.SetAutoMatchedPair(&model.MatchedPair{R1Path: read1.StorageKey, R2Path: read2.StorageKey})
+		if sample.GetManualMatchedPair() != nil {
+			sample.MatchStatus = model.SampleMatchMatched
+			sample.MatchMode = model.SampleMatchModeManual
+		} else {
+			sample.MatchStatus = model.SampleMatchMatched
+			sample.MatchMode = model.SampleMatchModeAutomatic
+		}
+		return tx.Save(&sample).Error
+	})
+}
+
+func (m *SampleMatcher) clearAutoMatch(sampleID uint, status model.SampleMatchStatus) {
+	_ = database.GetDB().Transaction(func(tx *gorm.DB) error {
+		var sample model.Sample
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&sample, sampleID).Error; err != nil {
+			return err
+		}
+		sample.SetAutoMatchedPair(nil)
+		if err := tx.Where("sample_id = ? AND match_mode = ?", sample.ID, model.SampleMatchModeAutomatic).Delete(&model.SampleDataLink{}).Error; err != nil {
+			return err
+		}
+		if sample.GetManualMatchedPair() != nil {
+			sample.MatchStatus = model.SampleMatchMatched
+			sample.MatchMode = model.SampleMatchModeManual
+		} else {
+			sample.MatchStatus = status
+			sample.MatchMode = ""
+		}
+		return tx.Save(&sample).Error
+	})
+}
+
+func parseFASTQPairName(name string) (string, model.ReadType, bool) {
+	base := filepath.Base(name)
+	lower := strings.ToLower(base)
+	for _, suffix := range []string{".fastq.gz", ".fq.gz", ".fastq", ".fq"} {
+		if strings.HasSuffix(lower, suffix) {
+			base = base[:len(base)-len(suffix)]
+			break
+		}
+	}
+	for _, pattern := range fastqPairPatterns {
+		matches := pattern.FindStringSubmatch(base)
+		if len(matches) != 3 {
+			continue
+		}
+		if matches[2] == "1" {
+			return fastqSampleKey(matches[1]), model.ReadTypeRead1, true
+		}
+		return fastqSampleKey(matches[1]), model.ReadTypeRead2, true
+	}
+	return "", "", false
+}
+
+func fastqSampleKey(key string) string {
+	if matches := uploadUUIDPrefix.FindStringSubmatch(key); len(matches) == 2 {
+		return matches[1]
+	}
+	return key
+}

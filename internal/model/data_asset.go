@@ -1,0 +1,109 @@
+package model
+
+import "time"
+
+type DataAssetSource string
+
+const (
+	DataAssetSourceUpload      DataAssetSource = "upload"
+	DataAssetSourceScanner     DataAssetSource = "scanner"
+	DataAssetSourceLocalImport DataAssetSource = "local_import"
+)
+
+// DataAsset is the organization-scoped identity for one stored data file.
+// StorageKey is deliberately omitted from all browser response models.
+type DataAsset struct {
+	ValidationStatus          string          `json:"validation_status" gorm:"size:32;not null;default:'pending'"`
+	ValidationCode            string          `json:"validation_code" gorm:"size:80;not null;default:''"`
+	ValidationSHA256          string          `json:"-" gorm:"size:64;not null;default:''"`
+	ValidationReferenceSHA256 string          `json:"-" gorm:"size:64;not null;default:''"`
+	ValidatedAt               *time.Time      `json:"validated_at,omitempty"`
+	ID                        uint            `json:"-" gorm:"primaryKey"`
+	UUID                      string          `json:"id" gorm:"uniqueIndex;size:36;not null"`
+	ExternalOrgID             string          `json:"-" gorm:"size:100;index"`
+	CreatedBy                 uint            `json:"-" gorm:"index;not null"`
+	UploadFileID              *uint           `json:"-" gorm:"uniqueIndex"`
+	Provider                  UploadProvider  `json:"provider" gorm:"size:20;index;uniqueIndex:idx_data_assets_provider_key;not null"`
+	StorageKey                string          `json:"-" gorm:"size:1000;uniqueIndex:idx_data_assets_provider_key;not null"`
+	FileName                  string          `json:"file_name" gorm:"size:500;not null"`
+	InternalID                string          `json:"internal_id,omitempty" gorm:"size:100;index"`
+	FileSize                  int64           `json:"file_size" gorm:"default:0"`
+	ReadType                  ReadType        `json:"read_type" gorm:"size:20;index;not null"`
+	ReferenceGenome           string          `json:"reference_genome,omitempty" gorm:"size:20;index"`
+	Status                    FileStatus      `json:"status" gorm:"size:20;index;not null;default:pending"`
+	Source                    DataAssetSource `json:"source" gorm:"size:20;index;not null;default:upload"`
+	ExpiresAt                 *time.Time      `json:"expires_at,omitempty" gorm:"index;type:timestamptz"`
+	CreatedAt                 time.Time       `json:"created_at" gorm:"type:timestamptz"`
+	UpdatedAt                 time.Time       `json:"updated_at" gorm:"type:timestamptz"`
+}
+
+type DataAssetResponse struct {
+	ValidationStatus string          `json:"validation_status,omitempty"`
+	ValidationCode   string          `json:"validation_code,omitempty"`
+	ValidatedAt      *time.Time      `json:"validated_at,omitempty"`
+	ID               string          `json:"id"`
+	FileName         string          `json:"file_name"`
+	InternalID       string          `json:"internal_id,omitempty"`
+	FileSize         int64           `json:"file_size"`
+	ReadType         ReadType        `json:"read_type"`
+	ReferenceGenome  string          `json:"reference_genome,omitempty"`
+	Provider         UploadProvider  `json:"provider"`
+	Status           FileStatus      `json:"status"`
+	Source           DataAssetSource `json:"source"`
+	ExpiresAt        *string         `json:"expires_at,omitempty"`
+	CreatedAt        string          `json:"created_at"`
+	UpdatedAt        string          `json:"updated_at"`
+}
+
+type DataAssetUpdateRequest struct {
+	InternalID string `json:"internal_id" binding:"omitempty,max=100"`
+}
+
+type DataAssetListQuery struct {
+	AvailableOnly   bool       `form:"available_only"`
+	Page            int        `form:"page" binding:"omitempty,min=1"`
+	PageSize        int        `form:"page_size" binding:"omitempty,min=1,max=100"`
+	Search          string     `form:"search"`
+	Status          FileStatus `form:"status"`
+	ReadType        ReadType   `form:"read_type"`
+	ReferenceGenome string     `form:"reference_genome"`
+	CreatedBy       uint       `json:"-" form:"-"`
+	OrgID           string     `json:"-" form:"-"`
+	IncludeAll      bool       `json:"-" form:"-"`
+	SharedInstance  bool       `json:"-" form:"-"`
+}
+
+type DataCenterConfigResponse struct {
+	LocalImportDirectory string         `json:"local_import_directory,omitempty"`
+	Provider             UploadProvider `json:"provider"`
+	RetentionDays        int            `json:"retention_days"`
+	Temporary            bool           `json:"temporary"`
+	DownloadAllowed      bool           `json:"download_allowed"`
+	MaxFileSizeBytes     int64          `json:"max_file_size_bytes"`
+}
+
+func DataAssetToResponse(asset *DataAsset) DataAssetResponse {
+	response := DataAssetResponse{
+		ValidationStatus: asset.ValidationStatus, ValidationCode: asset.ValidationCode, ValidatedAt: asset.ValidatedAt,
+		ID: asset.UUID, FileName: asset.FileName, InternalID: asset.InternalID, FileSize: asset.FileSize,
+		ReadType: asset.ReadType, Provider: asset.Provider, Status: asset.Status,
+		ReferenceGenome: asset.ReferenceGenome,
+		Source:          asset.Source, CreatedAt: asset.CreatedAt.Format(time.RFC3339),
+		UpdatedAt: asset.UpdatedAt.Format(time.RFC3339),
+	}
+	if asset.ExpiresAt != nil {
+		value := asset.ExpiresAt.Format(time.RFC3339)
+		response.ExpiresAt = &value
+	}
+	return response
+}
+
+func (DataAsset) TableName() string { return "data_assets" }
+
+// Each request registers one fully validated pair; the browser batches CSV rows.
+type LocalDataImportRequest struct {
+	InternalID string `json:"internal_id" binding:"required,max=100"`
+	VCFPath    string `json:"vcf_path" binding:"omitempty,max=1000"`
+	Read1Path  string `json:"read1_path" binding:"omitempty,max=1000"`
+	Read2Path  string `json:"read2_path" binding:"omitempty,max=1000"`
+}

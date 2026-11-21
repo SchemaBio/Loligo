@@ -1,0 +1,489 @@
+package handler
+
+import (
+	"fmt"
+	"net/http"
+	"strconv"
+	"strings"
+
+	"github.com/SchemaBio/Loligo/internal/config"
+	"github.com/SchemaBio/Loligo/internal/middleware"
+	"github.com/SchemaBio/Loligo/internal/model"
+	"github.com/SchemaBio/Loligo/internal/service"
+	"github.com/gin-gonic/gin"
+)
+
+type AuthHandler struct {
+	cfg         *config.Config
+	userService *service.UserService
+}
+
+func NewAuthHandler(cfg *config.Config) *AuthHandler {
+	return &AuthHandler{
+		cfg:         cfg,
+		userService: service.NewUserService(cfg),
+	}
+}
+
+// Login handles user login with email + password
+func (h *AuthHandler) Login(c *gin.Context) {
+	var req model.LoginRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		ErrorBadRequest(c, err.Error())
+		return
+	}
+
+	resp, err := h.userService.Login(req.Email, req.Password)
+	if err != nil {
+		ErrorUnauthorized(c, SanitizeAuthError(err))
+		return
+	}
+
+	service.SetTokenCookies(c, &h.cfg.JWT, resp.AccessToken, resp.RefreshToken, req.Remember)
+	Success(c, resp)
+}
+
+// Register handles user registration
+func (h *AuthHandler) Register(c *gin.Context) {
+	if h.cfg != nil && h.cfg.ExternalAuth.Enabled {
+		ErrorNotFound(c, "registration is not available")
+		return
+	}
+	var req model.RegisterRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		ErrorBadRequest(c, err.Error())
+		return
+	}
+
+	resp, err := h.userService.Register(&req)
+	if err != nil {
+		if err.Error() == "email already exists" {
+			SuccessCreated(c, gin.H{"message": "Registration submitted."})
+			return
+		}
+		ErrorInternal(c, SanitizeAuthError(err))
+		return
+	}
+
+	service.SetTokenCookies(c, &h.cfg.JWT, resp.AccessToken, resp.RefreshToken, true)
+	SuccessCreated(c, resp)
+}
+
+// Refresh handles token refresh
+func (h *AuthHandler) Refresh(c *gin.Context) {
+	var req model.RefreshRequest
+	if c.Request.Body != nil {
+		_ = c.ShouldBindJSON(&req)
+	}
+	if req.RefreshToken == "" {
+		if cookie, err := c.Cookie("refresh_token"); err == nil {
+			req.RefreshToken = cookie
+		}
+	}
+	if req.RefreshToken == "" {
+		ErrorBadRequest(c, "refresh token is required")
+		return
+	}
+
+	resp, err := h.userService.RefreshToken(req.RefreshToken)
+	if err != nil {
+		ErrorUnauthorized(c, SanitizeAuthError(err))
+		return
+	}
+
+	service.SetTokenCookies(c, &h.cfg.JWT, resp.AccessToken, resp.RefreshToken, true)
+	Success(c, resp)
+}
+
+func (h *AuthHandler) ChangePassword(c *gin.Context) {
+	userID, _, _, ok := middleware.GetCurrentUser(c)
+	if !ok {
+		ErrorUnauthorized(c, "Unauthorized")
+		return
+	}
+	var req model.ChangePasswordRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		ErrorBadRequest(c, err.Error())
+		return
+	}
+	if err := h.userService.ChangePassword(userID, req.OldPassword, req.NewPassword); err != nil {
+		ErrorBadRequest(c, err.Error())
+		return
+	}
+	user, err := h.userService.GetUserByID(userID)
+	if err != nil {
+		ErrorInternal(c, "failed to refresh session")
+		return
+	}
+	accessToken, refreshToken, expiresAt, err := service.NewJWTService(h.cfg).GenerateToken(user)
+	if err != nil {
+		ErrorInternal(c, "failed to refresh session")
+		return
+	}
+	service.SetTokenCookies(c, &h.cfg.JWT, accessToken, refreshToken, true)
+	Success(c, gin.H{"expires_at": expiresAt})
+}
+
+// Me returns the current authenticated user
+func (h *AuthHandler) Me(c *gin.Context) {
+	userID, _, _, ok := middleware.GetCurrentUser(c)
+	if !ok {
+		ErrorUnauthorized(c, "Unauthorized")
+		return
+	}
+
+	user, err := h.userService.GetUserByID(userID)
+	if err != nil {
+		ErrorNotFound(c, "User not found")
+		return
+	}
+
+	Success(c, model.UserToResponse(user))
+}
+
+// UpdateMe updates self-service profile fields for the current user.
+func (h *AuthHandler) UpdateMe(c *gin.Context) {
+	userID, _, _, ok := middleware.GetCurrentUser(c)
+	if !ok {
+		ErrorUnauthorized(c, "Unauthorized")
+		return
+	}
+
+	var req model.ProfileUpdateRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		ErrorBadRequest(c, err.Error())
+		return
+	}
+
+	user, err := h.userService.UpdateProfile(userID, &req)
+	if err != nil {
+		ErrorBadRequest(c, err.Error())
+		return
+	}
+	Success(c, model.UserToResponse(user))
+}
+
+// DeleteMe deletes the current non-super-admin account after email confirmation.
+func (h *AuthHandler) DeleteMe(c *gin.Context) {
+	userID, email, role, ok := middleware.GetCurrentUser(c)
+	if !ok {
+		ErrorUnauthorized(c, "Unauthorized")
+		return
+	}
+	if role == string(model.SystemRoleSuperAdmin) {
+		ErrorBadRequest(c, "administrator accounts cannot be deleted here")
+		return
+	}
+
+	var req model.AccountDeleteRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		ErrorBadRequest(c, err.Error())
+		return
+	}
+	if !strings.EqualFold(strings.TrimSpace(req.Email), email) {
+		ErrorBadRequest(c, "confirmation email does not match")
+		return
+	}
+
+	if err := h.userService.DeleteUser(userID); err != nil {
+		ErrorInternal(c, "failed to delete account")
+		return
+	}
+	service.ClearTokenCookies(c, &h.cfg.JWT)
+	c.Status(http.StatusNoContent)
+}
+
+// Logout handles user logout and invalidates the presented token when possible.
+func (h *AuthHandler) Logout(c *gin.Context) {
+	for _, token := range logoutTokens(c) {
+		if err := h.userService.RevokeToken(token); err == nil {
+			break
+		}
+	}
+
+	service.ClearTokenCookies(c, &h.cfg.JWT)
+	c.JSON(http.StatusOK, gin.H{"message": "Logged out successfully"})
+}
+
+func logoutTokens(c *gin.Context) []string {
+	var tokens []string
+	authHeader := c.GetHeader("Authorization")
+	if authHeader != "" {
+		parts := strings.SplitN(authHeader, " ", 2)
+		if len(parts) == 2 && parts[0] == "Bearer" {
+			tokens = append(tokens, parts[1])
+		}
+	}
+	if cookie, err := c.Cookie("access_token"); err == nil && cookie != "" {
+		tokens = append(tokens, cookie)
+	}
+	if cookie, err := c.Cookie("refresh_token"); err == nil && cookie != "" {
+		tokens = append(tokens, cookie)
+	}
+	return tokens
+}
+
+// ForgotPassword starts a password reset flow.
+func (h *AuthHandler) ForgotPassword(c *gin.Context) {
+	var req model.ForgotPasswordRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		ErrorBadRequest(c, err.Error())
+		return
+	}
+
+	token, err := h.userService.GenerateResetToken(req.Email)
+	if err != nil {
+		ErrorInternal(c, SanitizeAuthError(err))
+		return
+	}
+
+	// TODO: deliver token via email/SMS. Never return reset tokens in API responses.
+	_ = token
+
+	Success(c, gin.H{
+		"message": "If the email exists, a reset link has been sent",
+	})
+}
+
+// ResetPassword resets password using a reset token.
+func (h *AuthHandler) ResetPassword(c *gin.Context) {
+	var req model.ResetPasswordRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		ErrorBadRequest(c, err.Error())
+		return
+	}
+
+	if err := h.userService.ResetPassword(req.Token, req.NewPassword); err != nil {
+		ErrorBadRequest(c, err.Error())
+		return
+	}
+
+	Success(c, gin.H{"message": "Password reset successfully"})
+}
+
+// --- User management handlers (admin) ---
+
+type UserHandler struct {
+	svc *service.UserService
+}
+
+func NewUserHandler(cfg *config.Config) *UserHandler {
+	return &UserHandler{
+		svc: service.NewUserService(cfg),
+	}
+}
+
+func validateSystemRole(role model.SystemRole) error {
+	if role == "" || role == model.SystemRoleUser || role == model.SystemRoleSuperAdmin {
+		return nil
+	}
+	return fmt.Errorf("invalid system role")
+}
+
+func validateUserSelfMutation(currentID, targetID uint, req *model.UserUpdateRequest, deleting bool) error {
+	if currentID != targetID {
+		return nil
+	}
+	if deleting {
+		return fmt.Errorf("cannot delete your own account")
+	}
+	if req == nil {
+		return nil
+	}
+	if req.IsActive != nil && !*req.IsActive {
+		return fmt.Errorf("cannot deactivate your own account")
+	}
+	if req.SystemRole != "" && req.SystemRole != model.SystemRoleSuperAdmin {
+		return fmt.Errorf("cannot remove your own super-admin role")
+	}
+	return nil
+}
+
+// ListUsers returns paginated user list
+func (h *UserHandler) ListUsers(c *gin.Context) {
+	var query model.UserListQuery
+	if err := c.ShouldBindQuery(&query); err != nil {
+		ErrorBadRequest(c, err.Error())
+		return
+	}
+	if query.Page == 0 {
+		query.Page = 1
+	}
+	if query.PageSize == 0 {
+		query.PageSize = 10
+	}
+
+	resp, err := h.svc.ListUsers(&query)
+	if err != nil {
+		ErrorInternal(c, err.Error())
+		return
+	}
+
+	SuccessList(c, resp.Items, resp.Total, query.Page, query.PageSize)
+}
+
+// GetUser returns a single user by ID
+func (h *UserHandler) GetUser(c *gin.Context) {
+	id, err := strconv.ParseUint(c.Param("id"), 10, 32)
+	if err != nil {
+		ErrorBadRequest(c, "invalid user ID")
+		return
+	}
+
+	user, err := h.svc.GetUserByID(uint(id))
+	if err != nil {
+		ErrorNotFound(c, "User not found")
+		return
+	}
+
+	Success(c, model.UserToResponse(user))
+}
+
+// ListPendingUsers returns users awaiting administrator approval. Standalone
+// registration is approved by default, so this is normally an empty list but
+// keeps the permissions UI contract shared with Onykia.
+func (h *UserHandler) ListPendingUsers(c *gin.Context) {
+	users, err := h.svc.ListPendingUsers()
+	if err != nil {
+		ErrorInternal(c, err.Error())
+		return
+	}
+	Success(c, users)
+}
+
+// ApproveUser activates a pending user account.
+func (h *UserHandler) ApproveUser(c *gin.Context) {
+	id, err := strconv.ParseUint(c.Param("id"), 10, 32)
+	if err != nil {
+		ErrorBadRequest(c, "invalid user ID")
+		return
+	}
+	if _, err := h.svc.GetUserByID(uint(id)); err != nil {
+		ErrorNotFound(c, "User not found")
+		return
+	}
+	if err := h.svc.ApproveUser(uint(id)); err != nil {
+		ErrorBadRequest(c, err.Error())
+		return
+	}
+	Success(c, gin.H{"message": "User approved successfully"})
+}
+
+// RejectUser disables a pending user account.
+func (h *UserHandler) RejectUser(c *gin.Context) {
+	id, err := strconv.ParseUint(c.Param("id"), 10, 32)
+	if err != nil {
+		ErrorBadRequest(c, "invalid user ID")
+		return
+	}
+	if _, err := h.svc.GetUserByID(uint(id)); err != nil {
+		ErrorNotFound(c, "User not found")
+		return
+	}
+	if err := h.svc.RejectUser(uint(id)); err != nil {
+		ErrorBadRequest(c, err.Error())
+		return
+	}
+	Success(c, gin.H{"message": "User rejected"})
+}
+
+// CreateUser creates a new user (admin only)
+func (h *UserHandler) CreateUser(c *gin.Context) {
+	var req model.UserCreateRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		ErrorBadRequest(c, err.Error())
+		return
+	}
+	if req.Permissions != nil {
+		normalized, err := model.NormalizePermissions(*req.Permissions)
+		if err != nil {
+			ErrorBadRequest(c, err.Error())
+			return
+		}
+		req.Permissions = &normalized
+	}
+	if err := validateSystemRole(req.SystemRole); err != nil {
+		ErrorBadRequest(c, err.Error())
+		return
+	}
+
+	user, err := h.svc.CreateManagedUser(&req)
+	if err != nil {
+		if err.Error() == "email already exists" {
+			ErrorConflict(c, err.Error())
+		} else {
+			ErrorBadRequest(c, err.Error())
+		}
+		return
+	}
+	SuccessCreated(c, model.UserToResponse(user))
+}
+
+// UpdateUser updates user information
+func (h *UserHandler) UpdateUser(c *gin.Context) {
+	id, err := strconv.ParseUint(c.Param("id"), 10, 32)
+	if err != nil {
+		ErrorBadRequest(c, "invalid user ID")
+		return
+	}
+
+	var req model.UserUpdateRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		ErrorBadRequest(c, err.Error())
+		return
+	}
+	if req.Permissions != nil {
+		normalized, err := model.NormalizePermissions(*req.Permissions)
+		if err != nil {
+			ErrorBadRequest(c, err.Error())
+			return
+		}
+		req.Permissions = &normalized
+	}
+	if err := validateSystemRole(req.SystemRole); err != nil {
+		ErrorBadRequest(c, err.Error())
+		return
+	}
+	currentID, _, _, ok := middleware.GetCurrentUser(c)
+	if !ok {
+		ErrorUnauthorized(c, "Unauthorized")
+		return
+	}
+	if err := validateUserSelfMutation(currentID, uint(id), &req, false); err != nil {
+		ErrorBadRequest(c, err.Error())
+		return
+	}
+
+	user, err := h.svc.UpdateUser(uint(id), &req)
+	if err != nil {
+		ErrorNotFound(c, err.Error())
+		return
+	}
+
+	Success(c, model.UserToResponse(user))
+}
+
+// DeleteUser deletes a user
+func (h *UserHandler) DeleteUser(c *gin.Context) {
+	id, err := strconv.ParseUint(c.Param("id"), 10, 32)
+	if err != nil {
+		ErrorBadRequest(c, "invalid user ID")
+		return
+	}
+	currentID, _, _, ok := middleware.GetCurrentUser(c)
+	if !ok {
+		ErrorUnauthorized(c, "Unauthorized")
+		return
+	}
+	if err := validateUserSelfMutation(currentID, uint(id), nil, true); err != nil {
+		ErrorBadRequest(c, err.Error())
+		return
+	}
+
+	if err := h.svc.DeleteUser(uint(id)); err != nil {
+		ErrorNotFound(c, err.Error())
+		return
+	}
+
+	c.Status(http.StatusNoContent)
+}

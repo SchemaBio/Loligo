@@ -1,0 +1,242 @@
+package sepiida
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+
+	"github.com/SchemaBio/Loligo/internal/model"
+)
+
+var ErrNotFound = errors.New("Sepiida record not found")
+
+type HTTPStatusError struct{ StatusCode int }
+
+func (e *HTTPStatusError) Error() string {
+	return fmt.Sprintf("Sepiida error (status %d)", e.StatusCode)
+}
+
+// Client is the Sepiida API client
+type Client struct {
+	baseURL    string
+	queryKey   string
+	timeout    time.Duration
+	httpClient *http.Client
+}
+
+// NewClient creates a new Sepiida client
+func NewClient(baseURL, queryKey string) *Client {
+	timeout := 30 * time.Second
+	return &Client{
+		baseURL:    strings.TrimSpace(baseURL),
+		queryKey:   strings.TrimSpace(queryKey),
+		timeout:    timeout,
+		httpClient: &http.Client{Timeout: timeout},
+	}
+}
+
+// SetTimeout sets the HTTP timeout
+func (c *Client) SetTimeout(timeout time.Duration) {
+	c.timeout = timeout
+	c.httpClient.Timeout = timeout
+}
+
+// doRequest performs an HTTP request with authentication
+func (c *Client) doRequest(method, path string) ([]byte, error) {
+	if strings.TrimSpace(c.queryKey) == "" {
+		return nil, fmt.Errorf("Sepiida query key is not configured")
+	}
+	if method != http.MethodGet {
+		return nil, fmt.Errorf("unsupported Sepiida request method %q", method)
+	}
+
+	endpoint, err := joinURL(c.baseURL, path)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequest(method, endpoint, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Authorization", "Bearer "+c.queryKey)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response: %w", err)
+	}
+
+	if resp.StatusCode >= 400 {
+		if resp.StatusCode == http.StatusNotFound {
+			return nil, fmt.Errorf("%w: %s", ErrNotFound, resp.Status)
+		}
+		return nil, &HTTPStatusError{StatusCode: resp.StatusCode}
+	}
+
+	return body, nil
+}
+
+func (c *Client) GetAgentStatus(uuid, agentID string) (*model.SepiidaAgentSession, error) {
+	query := url.Values{"uuid": {uuid}, "agent_id": {agentID}}
+	body, err := c.doRequest(http.MethodGet, "/api/v1/agent/status?"+query.Encode())
+	if err != nil {
+		return nil, err
+	}
+	var session model.SepiidaAgentSession
+	if err := json.Unmarshal(body, &session); err != nil {
+		return nil, fmt.Errorf("failed to parse Sepiida agent status: %w", err)
+	}
+	if session.State == "legacy/unknown" {
+		return &session, nil
+	}
+	if session.UUID != uuid || session.AgentID != agentID {
+		return nil, fmt.Errorf("Sepiida returned a different agent attempt")
+	}
+	return &session, nil
+}
+
+// GetWorkflowByUUID queries workflow by UUID
+func (c *Client) GetWorkflowByUUID(uuid string) (*model.SepiidaWorkflow, error) {
+	return c.GetWorkflowByAttempt(uuid, "")
+}
+func (c *Client) GetWorkflowByAttempt(uuid, agentID string) (*model.SepiidaWorkflow, error) {
+	query := url.Values{"uuid": {uuid}}
+	if agentID != "" {
+		query.Set("agent_id", agentID)
+	}
+	body, err := c.doRequest("GET", "/api/v1/workflow?"+query.Encode())
+	if err != nil {
+		return nil, err
+	}
+
+	var resp model.SepiidaWorkflowResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	if resp.Error != "" {
+		return nil, fmt.Errorf("sepiida error: %s", resp.Error)
+	}
+
+	if agentID != "" && (resp.Workflow.UUID != uuid || resp.Workflow.AgentID != agentID) {
+		return nil, fmt.Errorf("Sepiida returned a different execution")
+	}
+	return &resp.Workflow, nil
+}
+
+// GetWorkflowByID queries workflow by ID
+func (c *Client) GetWorkflowByID(id string) (*model.SepiidaWorkflow, error) {
+	body, err := c.doRequest("GET", "/api/v1/workflow?"+url.Values{"id": {id}}.Encode())
+	if err != nil {
+		return nil, err
+	}
+
+	var resp model.SepiidaWorkflowResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	if resp.Error != "" {
+		return nil, fmt.Errorf("sepiida error: %s", resp.Error)
+	}
+
+	return &resp.Workflow, nil
+}
+
+// GetWorkflowTasks queries tasks for a workflow
+func (c *Client) GetWorkflowTasks(workflowID string) ([]model.SepiidaTask, error) {
+	body, err := c.doRequest("GET", "/api/v1/workflow/tasks?"+url.Values{"id": {workflowID}}.Encode())
+	if err != nil {
+		return nil, err
+	}
+
+	var resp model.SepiidaTasksResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	return resp.Tasks, nil
+}
+
+// ListWorkflows lists all workflows
+func (c *Client) ListWorkflows() ([]model.SepiidaWorkflow, error) {
+	body, err := c.doRequest("GET", "/api/v1/workflows")
+	if err != nil {
+		return nil, err
+	}
+
+	var resp model.SepiidaWorkflowsResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	return resp.Workflows, nil
+}
+
+// GetWorkflowWithTasks queries workflow with its tasks
+func (c *Client) GetWorkflowWithTasks(uuid string, agentID ...string) (*model.SepiidaWorkflow, []model.SepiidaTask, error) {
+	attempt := ""
+	if len(agentID) > 0 {
+		attempt = agentID[0]
+	}
+	workflow, err := c.GetWorkflowByAttempt(uuid, attempt)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if workflow == nil {
+		return nil, nil, nil
+	}
+
+	tasks, err := c.GetWorkflowTasks(workflow.ID)
+	if err != nil {
+		return workflow, nil, err
+	}
+
+	return workflow, tasks, nil
+}
+
+// Health checks Sepiida server health
+func (c *Client) Health() error {
+	_, err := c.doRequest(http.MethodGet, "/health")
+	return err
+}
+
+func joinURL(baseURL, endpointPath string) (string, error) {
+	base, err := url.Parse(strings.TrimSpace(baseURL))
+	if err != nil {
+		return "", err
+	}
+	if base.Scheme != "http" && base.Scheme != "https" {
+		return "", fmt.Errorf("unsupported Sepiida URL scheme %q", base.Scheme)
+	}
+	if base.Host == "" {
+		return "", fmt.Errorf("invalid Sepiida base URL")
+	}
+	if base.User != nil {
+		return "", fmt.Errorf("Sepiida base URL must not include user info")
+	}
+	ref, err := url.Parse(endpointPath)
+	if err != nil {
+		return "", err
+	}
+	if ref.IsAbs() || ref.Host != "" {
+		return "", fmt.Errorf("Sepiida request path must be relative")
+	}
+	base.Path = strings.TrimRight(base.Path, "/") + "/" + strings.TrimLeft(ref.Path, "/")
+	base.RawQuery = ref.RawQuery
+	base.Fragment = ""
+	return base.String(), nil
+}

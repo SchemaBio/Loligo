@@ -1,0 +1,308 @@
+package service
+
+import (
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/SchemaBio/Loligo/internal/config"
+	"github.com/SchemaBio/Loligo/internal/model"
+)
+
+func TestReplaceInputStringRecurses(t *testing.T) {
+	inputs := map[string]interface{}{
+		"direct": "objects/r1.fastq.gz",
+		"nested": []interface{}{
+			map[string]interface{}{"file": "objects/r1.fastq.gz"},
+			"unchanged",
+		},
+	}
+	replaced := replaceInputString(inputs, "objects/r1.fastq.gz", "/mnt/data/inputs/r1.fastq.gz").(map[string]interface{})
+	if replaced["direct"] != "/mnt/data/inputs/r1.fastq.gz" {
+		t.Fatalf("direct input was not replaced: %#v", replaced)
+	}
+	nested := replaced["nested"].([]interface{})
+	if nested[0].(map[string]interface{})["file"] != "/mnt/data/inputs/r1.fastq.gz" || nested[1] != "unchanged" {
+		t.Fatalf("nested input replacement is wrong: %#v", nested)
+	}
+}
+
+func TestCVMReferenceGenome(t *testing.T) {
+	for input, want := range map[string]string{"": "hg19", "GRCh37": "hg19", "hg38": "hg38", "GRCh38": "hg38"} {
+		got, err := cvmReferenceGenome(map[string]interface{}{"reference_genome": input})
+		if err != nil || got != want {
+			t.Fatalf("resolve %q: got %q, err=%v", input, got, err)
+		}
+	}
+	if _, err := cvmReferenceGenome(map[string]interface{}{"reference_genome": "mm10"}); err == nil {
+		t.Fatal("unsupported reference genome was accepted")
+	}
+}
+
+func TestBuildCVMWDLInputsBuildsHG38SingleInputs(t *testing.T) {
+	inputs, err := buildCVMWDLInputs("single", "hg38", map[string]interface{}{
+		"fastq_r1": "/mnt/data/inputs/sample-r1.fastq.gz",
+		"fastq_r2": "/mnt/data/inputs/sample-r2.fastq.gz",
+		"bed_file": "/mnt/data/inputs/panel.bed",
+	})
+	if err != nil {
+		t.Fatalf("build inputs: %v", err)
+	}
+	if inputs["SingleWES.read_1"] != "/mnt/data/inputs/sample-r1.fastq.gz" || inputs["SingleWES.read_2"] != "/mnt/data/inputs/sample-r2.fastq.gz" {
+		t.Fatalf("user FASTQ paths were not applied: %#v", inputs)
+	}
+	if inputs["SingleWES.bed"] != "/mnt/data/inputs/panel.bed" {
+		t.Fatalf("user BED path was not applied: %#v", inputs)
+	}
+	if inputs["SingleWES.fasta"] != "/mnt/data/database/Homo_sapiens.GRCh38.dna.primary_assembly.fa" || inputs["SingleWES.assembly"] != "GRCh38" {
+		t.Fatalf("hg38 reference values were not generated: %#v", inputs)
+	}
+}
+
+func TestBuildCVMWDLInputsUsesBaselineFixContract(t *testing.T) {
+	inputs, err := buildCVMWDLInputs("baseline_fix", "hg38", map[string]interface{}{
+		"CNVBaselineFix.prefix": "8da4d946",
+		"bed_file":              "/mnt/data/inputs/panel.bed",
+	})
+	if err != nil {
+		t.Fatalf("build baseline_fix inputs: %v", err)
+	}
+	if inputs["CNVBaselineFix.prefix"] != "8da4d946" || inputs["CNVBaselineFix.bed"] != "/mnt/data/inputs/panel.bed" {
+		t.Fatalf("baseline_fix overrides were not applied: %#v", inputs)
+	}
+	if inputs["CNVBaselineFix.assembly"] != "GRCh38" || inputs["CNVBaselineFix.existing_sample_count"] != float64(20) {
+		t.Fatalf("baseline_fix built-in reference metadata is wrong: %#v", inputs)
+	}
+	if _, legacy := inputs["CNVBaseline.prefix"]; legacy {
+		t.Fatal("legacy baseline workflow input was exposed")
+	}
+}
+
+func TestTrioPEDUsesStrictMemberOrderAndCodes(t *testing.T) {
+	members := []model.PedigreeMember{
+		{Gender: model.GenderMale, AffectedStatus: model.AffectedStatusAffected},
+		{Gender: model.GenderMale, AffectedStatus: model.AffectedStatusUnaffected},
+		{Gender: model.GenderFemale, AffectedStatus: model.AffectedStatusUnaffected},
+	}
+	want := "8da4d946\tproband\tfather\tmother\t1\t2\n8da4d946\tfather\t0\t0\t1\t1\n8da4d946\tmother\t0\t0\t2\t1\n"
+	if got := trioPED("8da4d946", members); got != want {
+		t.Fatalf("PED = %q, want %q", got, want)
+	}
+}
+
+func TestSafeCVMInputName(t *testing.T) {
+	if got := safeCVMInputName(`../sample R1;rm.fastq.gz`); got != "sample_R1_rm.fastq.gz" {
+		t.Fatalf("unexpected safe input name: %q", got)
+	}
+}
+
+func TestStructuredResultFileSelection(t *testing.T) {
+	for _, name := range []string{"sample.snv_indel.tsv", "sample.region.cnvanno.txt", "sample.str.txt", "sample.roh.tsv"} {
+		if !isStructuredResultFile(name) {
+			t.Fatalf("expected structured result file: %s", name)
+		}
+	}
+	for _, name := range []string{"sample.bam", "sample.vcf.gz", "sample.snv_indel.parquet", "workflow.log"} {
+		if isStructuredResultFile(name) {
+			t.Fatalf("unexpected structured result file: %s", name)
+		}
+	}
+}
+
+func TestSepiidaWorkflowUUIDUsesCurrentCVMExecutionAttempt(t *testing.T) {
+	task := &model.Task{UUID: "9e906aba-75f0-4b68-a355-5138b0f07c42", Executor: model.ExecutorCVM, ExecutionAttemptID: "2897aa33-054d-4a00-88c6-40701d0cf491"}
+	if got := sepiidaWorkflowUUID(task); got != task.UUID {
+		t.Fatalf("expected stable task UUID, got %q", got)
+	}
+	if sepiidaWorkflowAgentID(task) != task.ExecutionAttemptID {
+		t.Fatal("CVM query must include the current attempt")
+	}
+	task.Executor = model.ExecutorLocal
+	if sepiidaWorkflowAgentID(task) != "" {
+		t.Fatal("community query must not filter agent")
+	}
+	if got := sepiidaWorkflowUUID(task); got != task.UUID {
+		t.Fatalf("community executor must keep task UUID, got %q", got)
+	}
+}
+
+func TestCVMAttemptTerminalStates(t *testing.T) {
+	for _, state := range []string{"TERMINATED", "reclaimed", "launch_failed"} {
+		if !cvmAttemptStateTerminal(state) {
+			t.Fatalf("expected terminal state %q", state)
+		}
+	}
+	for _, state := range []string{"RUNNING", "STOPPED", "SHUTDOWN", "FAILED", "TERMINATING"} {
+		if cvmAttemptStateTerminal(state) {
+			t.Fatalf("%s must remain active until resource release is confirmed", state)
+		}
+	}
+}
+
+func TestCVMStateEventOnlyMatchesCurrentAttempt(t *testing.T) {
+	task := &model.Task{ExecutionAttemptID: "2897aa33-054d-4a00-88c6-40701d0cf491"}
+	current := model.CVMStateEvent{AttemptID: task.ExecutionAttemptID}
+	stale := model.CVMStateEvent{AttemptID: "8db870b7-a65f-48ea-9d9c-8e5f799ae213"}
+	if !cvmStateEventMatchesCurrentAttempt(task, current) {
+		t.Fatal("current execution attempt should match")
+	}
+	if cvmStateEventMatchesCurrentAttempt(task, stale) {
+		t.Fatal("stale execution attempt must be ignored")
+	}
+}
+
+func TestCVMFailureDiagnosticPreservesPreflightError(t *testing.T) {
+	task := &model.Task{Status: model.TaskStatusFailed, Error: "reference mapping indexes are missing", ExecutionReasonCode: "REFERENCE_DATABASE_FAILED"}
+	for _, message := range []string{"", model.OverlayTaskEventFailed} {
+		got, reason := cvmFailureDiagnostic(task, model.CVMStateEvent{TaskStatus: model.TaskStatusFailed, Message: message})
+		if got != task.Error || reason != task.ExecutionReasonCode {
+			t.Fatalf("generic release callback erased preflight diagnosis: %q %q", got, reason)
+		}
+	}
+	got, reason := cvmFailureDiagnostic(task, model.CVMStateEvent{TaskStatus: model.TaskStatusFailed, Message: "input download failed", ReasonCode: "INPUT_DOWNLOAD_FAILED"})
+	if got != "input download failed" || reason != "INPUT_DOWNLOAD_FAILED" {
+		t.Fatalf("explicit diagnosis did not replace previous error: %q %q", got, reason)
+	}
+	task.Status = model.TaskStatusQueued
+	got, reason = cvmFailureDiagnostic(task, model.CVMStateEvent{TaskStatus: model.TaskStatusFailed})
+	if got == task.Error || reason != "" {
+		t.Fatal("a newly failing task must not inherit a stale failure")
+	}
+}
+
+func TestCVMEventBusinessStartClassification(t *testing.T) {
+	if cvmEventCarriesBusinessStart(model.CVMStateEvent{TaskStatus: model.TaskStatusQueued, ExecutionPhase: "bootstrapping", StartedAt: ptrTimeForCVMTest(time.Now())}) {
+		t.Fatal("bootstrap timestamp must not mark the workflow as running")
+	}
+	if !cvmEventCarriesBusinessStart(model.CVMStateEvent{TaskStatus: model.TaskStatusRunning, ExecutionPhase: "running", StartedAt: ptrTimeForCVMTest(time.Now())}) {
+		t.Fatal("running callback must carry business start")
+	}
+	if cvmEventCarriesBusinessStart(model.CVMStateEvent{TaskStatus: model.TaskStatusCancelled, ExecutionPhase: "terminating", StartedAt: ptrTimeForCVMTest(time.Now())}) {
+		t.Fatal("termination timestamp without a running phase must not mark the workflow as running")
+	}
+}
+
+func ptrTimeForCVMTest(value time.Time) *time.Time { return &value }
+
+func TestCVMTaskNeedsCancelWithoutKnownInstance(t *testing.T) {
+	task := &model.Task{Executor: model.ExecutorCVM, ExecutionAttemptID: "2897aa33-054d-4a00-88c6-40701d0cf491"}
+	if !cvmTaskNeedsCancel(task) {
+		t.Fatal("a dispatching attempt must be cancellable before its instance ID is known")
+	}
+	task.Executor = model.ExecutorLocal
+	if cvmTaskNeedsCancel(task) {
+		t.Fatal("community execution must not call the Onykia CVM cancel endpoint")
+	}
+}
+
+func TestCVMArchiveTerminationRequiresStagedCurrentAttempt(t *testing.T) {
+	now := time.Now()
+	task := &model.Task{Executor: model.ExecutorCVM, ExecutionAttemptID: "2897aa33-054d-4a00-88c6-40701d0cf491"}
+	if cvmArchiveTerminationPending(task) {
+		t.Fatal("unstaged archive must not release the CVM")
+	}
+	task.CVMArchiveStagedAt = &now
+	if !cvmArchiveTerminationPending(task) {
+		t.Fatal("staged archive for the current attempt must release the CVM")
+	}
+	task.CVMArchiveTerminationNotifiedAt = &now
+	if cvmArchiveTerminationPending(task) {
+		t.Fatal("acknowledged archive release must not be retried")
+	}
+	task.CVMArchiveTerminationNotifiedAt = nil
+	task.ExecutionAttemptID = ""
+	if cvmArchiveTerminationPending(task) {
+		t.Fatal("archive without an execution attempt must not release a CVM")
+	}
+}
+
+func TestCVMFinalManifestKeyUsesStableTaskRoot(t *testing.T) {
+	task := &model.Task{
+		UUID:               "9e906aba-75f0-4b68-a355-5138b0f07c42",
+		ExternalOrgID:      "f83165ee-e23c-4bf1-a42e-78ac39c6f1ba",
+		ExecutionAttemptID: "2897aa33-054d-4a00-88c6-40701d0cf491",
+	}
+	got, err := cvmFinalManifestKey(task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "organizations/f83165ee-e23c-4bf1-a42e-78ac39c6f1ba/workflows/9e906aba-75f0-4b68-a355-5138b0f07c42/final.json"
+	if got != want {
+		t.Fatalf("unexpected final manifest key: %q", got)
+	}
+}
+
+func TestTaskArchiveDirSeparatesCVMExecutionAttempts(t *testing.T) {
+	base := filepath.Join("var", "archive")
+	task := &model.Task{
+		UUID:               "9e906aba-75f0-4b68-a355-5138b0f07c42",
+		Executor:           model.ExecutorCVM,
+		ExecutionAttemptID: "2897aa33-054d-4a00-88c6-40701d0cf491",
+	}
+	got, err := taskArchiveDir(base, task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(base, task.UUID, "attempts", task.ExecutionAttemptID)
+	if got != want {
+		t.Fatalf("unexpected CVM archive directory: %q", got)
+	}
+	task.Executor = model.ExecutorLocal
+	got, err = taskArchiveDir(base, task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := filepath.Join(base, task.UUID); got != want {
+		t.Fatalf("community archive directory changed: %q", got)
+	}
+}
+
+func TestValidatedCOSArchivePrefixRejectsStaleAttempt(t *testing.T) {
+	task := &model.Task{
+		UUID:               "9e906aba-75f0-4b68-a355-5138b0f07c42",
+		ExternalOrgID:      "f83165ee-e23c-4bf1-a42e-78ac39c6f1ba",
+		Executor:           model.ExecutorCVM,
+		ExecutionAttemptID: "2897aa33-054d-4a00-88c6-40701d0cf491",
+	}
+	storageCfg := config.StorageConfig{S3Bucket: "bucket-1250000000", S3Region: "ap-guangzhou"}
+	metadata := model.SepiidaArchiveMetadata{
+		ArchiveBase:        "https://bucket-1250000000.cos.ap-guangzhou.myqcloud.com/organizations/" + task.ExternalOrgID + "/workflows/" + task.UUID + "/attempts",
+		ArchivePrefix:      task.ExecutionAttemptID,
+		OutputsResolvedKey: task.ExecutionAttemptID + "/outputs.resolved.json",
+	}
+	got, err := validatedCOSArchivePrefix(task, metadata, storageCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "organizations/" + task.ExternalOrgID + "/workflows/" + task.UUID + "/attempts/" + task.ExecutionAttemptID
+	if got != want {
+		t.Fatalf("unexpected archive prefix: %q", got)
+	}
+	metadata.ArchivePrefix = "8db870b7-a65f-48ea-9d9c-8e5f799ae213"
+	if _, err := validatedCOSArchivePrefix(task, metadata, storageCfg); err == nil || !strings.Contains(err.Error(), "current execution attempt") {
+		t.Fatalf("expected stale attempt to be rejected, got %v", err)
+	}
+}
+
+func TestTerminalOverlayEventForDuplicateCVMCallback(t *testing.T) {
+	tests := []struct {
+		name          string
+		eventStatus   model.TaskStatus
+		currentStatus model.TaskStatus
+		want          string
+	}{
+		{name: "cancelled retry", eventStatus: model.TaskStatusCancelled, currentStatus: model.TaskStatusCancelled, want: model.OverlayTaskEventCancelled},
+		{name: "failed retry", eventStatus: model.TaskStatusFailed, currentStatus: model.TaskStatusFailed, want: model.OverlayTaskEventFailed},
+		{name: "completed retry", eventStatus: model.TaskStatusCompleted, currentStatus: model.TaskStatusCompleted, want: model.OverlayTaskEventCompleted},
+		{name: "late cancellation after failure", eventStatus: model.TaskStatusCancelled, currentStatus: model.TaskStatusFailed},
+		{name: "late failure after cancellation", eventStatus: model.TaskStatusFailed, currentStatus: model.TaskStatusCancelled},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := terminalOverlayEventForCVMState(tt.eventStatus, tt.currentStatus); got != tt.want {
+				t.Fatalf("terminal overlay event = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}

@@ -1,0 +1,204 @@
+package repository
+
+import (
+	"fmt"
+
+	"github.com/SchemaBio/Loligo/internal/model"
+)
+
+// SampleRepository provides sample-specific operations
+type SampleRepository struct {
+	*Repository[model.Sample]
+}
+
+// NewSampleRepository creates a new sample repository
+func NewSampleRepository() *SampleRepository {
+	return &SampleRepository{
+		Repository: NewRepository[model.Sample](),
+	}
+}
+
+// FindByUUID finds a sample by UUID
+func (r *SampleRepository) FindByUUID(uuid string) (*model.Sample, error) {
+	return r.FindOneByCondition(map[string]interface{}{"uuid": uuid})
+}
+
+func (r *SampleRepository) FindScopedByUUID(uuid string, actor model.OverlayActor) (*model.Sample, error) {
+	return r.findScoped("uuid = ?", actor, uuid)
+}
+
+// FindScopedByIdentifier accepts either the public sample UUID or the
+// tenant-scoped internal identifier used in batch spreadsheets.
+func (r *SampleRepository) FindScopedByIdentifier(identifier string, actor model.OverlayActor) (*model.Sample, error) {
+	if sample, err := r.findScoped("uuid = ?", actor, identifier); err == nil {
+		return sample, nil
+	}
+	db := r.db.Where("internal_id = ?", identifier)
+	if actor.SharedInstance {
+		db = db.Where("COALESCE(external_org_id, '') = ''")
+	} else if actor.OrgID != "" {
+		db = db.Where("external_org_id = ?", actor.OrgID)
+	} else if actor.Role != string(model.SystemRoleSuperAdmin) {
+		db = db.Where("external_org_id = '' AND created_by = ?", actor.UserID)
+	}
+	var samples []model.Sample
+	if err := db.Limit(2).Find(&samples).Error; err != nil {
+		return nil, err
+	}
+	if len(samples) != 1 {
+		return nil, fmt.Errorf("sample identifier is missing or ambiguous")
+	}
+	return &samples[0], nil
+}
+
+func (r *SampleRepository) findScoped(condition string, actor model.OverlayActor, args ...interface{}) (*model.Sample, error) {
+	db := r.db.Where(condition, args...)
+	if actor.SharedInstance {
+		db = db.Where("COALESCE(external_org_id, '') = ''")
+	} else if actor.OrgID != "" {
+		db = db.Where("external_org_id = ?", actor.OrgID)
+	} else if actor.Role != string(model.SystemRoleSuperAdmin) {
+		db = db.Where("external_org_id = '' AND created_by = ?", actor.UserID)
+	}
+	var sample model.Sample
+	if err := db.First(&sample).Error; err != nil {
+		return nil, err
+	}
+	return &sample, nil
+}
+
+// FindByInternalID finds a sample by internal_id
+func (r *SampleRepository) FindByInternalID(internalID string) (*model.Sample, error) {
+	return r.FindOneByCondition(map[string]interface{}{"internal_id": internalID})
+}
+
+// ExistsByInternalID checks if internal_id exists
+func (r *SampleRepository) ExistsByInternalID(internalID string) bool {
+	var count int64
+	r.db.Model(&model.Sample{}).Where("internal_id = ?", internalID).Count(&count)
+	return count > 0
+}
+
+func (r *SampleRepository) ExistsByInternalIDInScope(internalID, orgID string, userID uint, excludeID uint, shared ...bool) bool {
+	db := r.db.Model(&model.Sample{}).Where("internal_id = ?", internalID)
+	if len(shared) > 0 && shared[0] {
+		db = db.Where("COALESCE(external_org_id, '') = ''")
+	} else if orgID != "" {
+		db = db.Where("external_org_id = ?", orgID)
+	} else {
+		db = db.Where("external_org_id = '' AND created_by = ?", userID)
+	}
+	if excludeID != 0 {
+		db = db.Where("id <> ?", excludeID)
+	}
+	var count int64
+	db.Count(&count)
+	return count > 0
+}
+
+// FindByProjectID finds samples by project ID
+func (r *SampleRepository) FindByProjectID(projectID uint) ([]model.Sample, error) {
+	return r.FindByCondition(map[string]interface{}{"project_id": projectID})
+}
+
+// UpdateStatus updates sample status
+func (r *SampleRepository) UpdateStatus(id uint, status model.SampleStatus) error {
+	return r.db.Model(&model.Sample{}).Where("id = ?", id).Update("status", status).Error
+}
+
+// PaginateByQuery paginates samples with filters
+func (r *SampleRepository) PaginateByQuery(query *model.SampleListQuery) ([]model.Sample, int64, error) {
+	db := r.db.Model(&model.Sample{})
+
+	if query.SharedInstance {
+		db = db.Where("COALESCE(external_org_id, '') = ''")
+	}
+	if !query.IncludeAll {
+		if query.OrgID != "" {
+			db = db.Where("external_org_id = ?", query.OrgID)
+		} else if query.CreatedBy != 0 {
+			db = db.Where("external_org_id = '' AND created_by = ?", query.CreatedBy)
+		} else {
+			db = db.Where("1 = 0")
+		}
+	}
+	if query.AnalysisType == "trio" {
+		db = db.Where("(father_sample_internal_id <> '' OR father_sample_uuid <> '') AND (mother_sample_internal_id <> '' OR mother_sample_uuid <> '')")
+	}
+	if query.Search != "" {
+		search := "%" + query.Search + "%"
+		db = db.Where("internal_id ILIKE ? OR uuid ILIKE ?", search, search)
+	}
+	if query.Status != "" {
+		db = db.Where("status = ?", query.Status)
+	}
+	if query.SampleType != "" {
+		db = db.Where("sample_type = ?", query.SampleType)
+	}
+	if query.ProjectID > 0 {
+		db = db.Where("project_id = ?", query.ProjectID)
+	}
+
+	var total int64
+	err := db.Count(&total).Error
+	if err != nil {
+		return nil, 0, err
+	}
+
+	page := query.Page
+	if page < 1 {
+		page = 1
+	}
+	pageSize := query.PageSize
+	if pageSize < 1 {
+		pageSize = 10
+	}
+
+	var samples []model.Sample
+	offset := (page - 1) * pageSize
+	err = db.Order("created_at DESC").Offset(offset).Limit(pageSize).Find(&samples).Error
+	return samples, total, err
+}
+
+func (r *SampleRepository) FindAutoMatchable(limit int) ([]model.Sample, error) {
+	if limit <= 0 {
+		limit = 500
+	}
+	var samples []model.Sample
+	err := r.db.Where("auto_match_enabled = ?", true).
+		Order("updated_at ASC").Limit(limit).Find(&samples).Error
+	return samples, err
+}
+
+// AssignProject assigns samples to a project
+func (r *SampleRepository) AssignProject(sampleIDs []uint, projectID uint) error {
+	return r.db.Model(&model.Sample{}).Where("id IN ?", sampleIDs).Update("project_id", projectID).Error
+}
+
+// CountByStatusAndProject counts samples by status for a project
+func (r *SampleRepository) CountByStatusAndProject(projectID uint) (map[model.SampleStatus]int64, error) {
+	type result struct {
+		Status model.SampleStatus
+		Count  int64
+	}
+	var results []result
+	err := r.db.Model(&model.Sample{}).
+		Where("project_id = ?", projectID).
+		Select("status, COUNT(*) as count").
+		Group("status").
+		Scan(&results).Error
+	if err != nil {
+		return nil, err
+	}
+
+	counts := map[model.SampleStatus]int64{
+		model.SampleStatusPending:    0,
+		model.SampleStatusProcessing: 0,
+		model.SampleStatusCompleted:  0,
+		model.SampleStatusFailed:     0,
+	}
+	for _, r := range results {
+		counts[r.Status] = r.Count
+	}
+	return counts, nil
+}

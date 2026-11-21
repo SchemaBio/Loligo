@@ -1,0 +1,241 @@
+package handler
+
+import (
+	"net/http"
+
+	"github.com/SchemaBio/Loligo/internal/config"
+	"github.com/SchemaBio/Loligo/internal/middleware"
+	"github.com/SchemaBio/Loligo/internal/model"
+	"github.com/SchemaBio/Loligo/internal/service"
+	"github.com/gin-gonic/gin"
+)
+
+type SampleHandler struct {
+	svc   *service.SampleService
+	tasks *service.TaskService
+}
+
+func NewSampleHandler(cfg *config.Config) *SampleHandler {
+	return &SampleHandler{
+		svc:   service.NewSampleService(cfg),
+		tasks: service.NewTaskService(cfg),
+	}
+}
+
+// CreateSample creates a new sample
+func (h *SampleHandler) CreateSample(c *gin.Context) {
+	var req model.SampleCreateRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		ErrorBadRequest(c, err.Error())
+		return
+	}
+
+	if _, _, _, ok := middleware.GetCurrentUser(c); !ok {
+		ErrorUnauthorized(c, "Unauthorized")
+		return
+	}
+
+	sample, err := h.svc.CreateSample(c.Request.Context(), &req, taskActorFromContext(c))
+	if err != nil {
+		ErrorInternal(c, err.Error())
+		return
+	}
+
+	if sample == nil {
+		ErrorConflict(c, "internal_id already exists")
+		return
+	}
+
+	SuccessCreated(c, h.svc.SampleToResponse(sample))
+}
+
+// ListSamples returns paginated sample list
+func (h *SampleHandler) ListSamples(c *gin.Context) {
+	var query model.SampleListQuery
+	if err := c.ShouldBindQuery(&query); err != nil {
+		ErrorBadRequest(c, err.Error())
+		return
+	}
+
+	if query.Page == 0 {
+		query.Page = 1
+	}
+	if query.PageSize == 0 {
+		query.PageSize = 10
+	}
+	userID, _, role, ok := middleware.GetCurrentUser(c)
+	if !ok {
+		ErrorUnauthorized(c, "Unauthorized")
+		return
+	}
+	if orgID, hasOrg := middleware.GetCurrentOrg(c); hasOrg && orgID != "" {
+		query.OrgID = orgID
+	} else if middleware.IsSharedInstance(c) || role == string(model.SystemRoleSuperAdmin) {
+		query.IncludeAll = true
+		query.SharedInstance = middleware.IsSharedInstance(c)
+	} else {
+		query.CreatedBy = userID
+	}
+
+	resp, err := h.svc.ListSamples(c.Request.Context(), &query)
+	if err != nil {
+		ErrorInternal(c, err.Error())
+		return
+	}
+
+	SuccessList(c, resp.Items, resp.Total, query.Page, query.PageSize)
+}
+
+// GetSample returns a single sample by UUID
+func (h *SampleHandler) GetSample(c *gin.Context) {
+	id := c.Param("id")
+
+	sample, err := h.svc.GetSampleScoped(c.Request.Context(), id, taskActorFromContext(c))
+	if err != nil {
+		ErrorNotFound(c, "Sample not found")
+		return
+	}
+
+	Success(c, h.svc.SampleToDetailResponse(sample))
+}
+
+// GetDataLink returns the effective pair's public, organization-scoped metadata.
+func (h *SampleHandler) GetDataLink(c *gin.Context) {
+	result, err := h.svc.GetDataLink(c.Request.Context(), c.Param("id"), taskActorFromContext(c))
+	if err != nil {
+		ErrorNotFound(c, "Sample data link unavailable")
+		return
+	}
+	Success(c, result)
+}
+
+// UpdateSample updates sample information.
+func (h *SampleHandler) UpdateSample(c *gin.Context) {
+	id := c.Param("id")
+
+	var req model.SampleUpdateRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		ErrorBadRequest(c, err.Error())
+		return
+	}
+
+	existing, err := h.svc.GetSampleScoped(c.Request.Context(), id, taskActorFromContext(c))
+	if err != nil {
+		ErrorNotFound(c, "Sample not found")
+		return
+	}
+	_ = existing
+
+	sample, err := h.svc.UpdateSample(c.Request.Context(), id, &req, taskActorFromContext(c))
+	if err != nil {
+		ErrorNotFound(c, err.Error())
+		return
+	}
+
+	Success(c, h.svc.SampleToResponse(sample))
+}
+
+// ClearMatchedPair removes sequencing-data matching from a sample.
+func (h *SampleHandler) ClearMatchedPair(c *gin.Context) {
+	id := c.Param("id")
+
+	existing, err := h.svc.GetSampleScoped(c.Request.Context(), id, taskActorFromContext(c))
+	if err != nil {
+		ErrorNotFound(c, "Sample not found")
+		return
+	}
+	_ = existing
+
+	sample, err := h.svc.ClearMatchedPair(c.Request.Context(), id, taskActorFromContext(c))
+	if err != nil {
+		ErrorNotFound(c, err.Error())
+		return
+	}
+
+	Success(c, h.svc.SampleToDetailResponse(sample))
+}
+
+// MatchFromUploadJob binds a completed upload job's read1/read2 files to a sample.
+func (h *SampleHandler) MatchFromUploadJob(c *gin.Context) {
+	id := c.Param("id")
+
+	var req model.SampleMatchUploadJobRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		ErrorBadRequest(c, err.Error())
+		return
+	}
+
+	existing, err := h.svc.GetSampleScoped(c.Request.Context(), id, taskActorFromContext(c))
+	if err != nil {
+		ErrorNotFound(c, "Sample not found")
+		return
+	}
+	_ = existing
+
+	sample, err := h.svc.MatchFromUploadJob(c.Request.Context(), id, req.UploadJobID, taskActorFromContext(c))
+	if err != nil {
+		ErrorBadRequest(c, err.Error())
+		return
+	}
+
+	Success(c, h.svc.SampleToDetailResponse(sample))
+}
+
+func (h *SampleHandler) LinkDataAssets(c *gin.Context) {
+	var req model.SampleDataLinkRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		ErrorBadRequest(c, err.Error())
+		return
+	}
+	sample, err := h.svc.LinkDataAssets(c.Request.Context(), c.Param("id"), &req, taskActorFromContext(c))
+	if err != nil {
+		ErrorBadRequest(c, err.Error())
+		return
+	}
+	Success(c, h.svc.SampleToDetailResponse(sample))
+}
+
+// DeleteSample deletes a sample
+func (h *SampleHandler) DeleteSample(c *gin.Context) {
+	id := c.Param("id")
+	existing, err := h.svc.GetSampleScoped(c.Request.Context(), id, taskActorFromContext(c))
+	if err != nil {
+		ErrorNotFound(c, "Sample not found")
+		return
+	}
+	_ = existing
+
+	if err := h.svc.DeleteSample(c.Request.Context(), id, taskActorFromContext(c)); err != nil {
+		ErrorNotFound(c, err.Error())
+		return
+	}
+
+	c.Status(http.StatusNoContent)
+}
+
+func (h *SampleHandler) ResolveParents(c *gin.Context) {
+	var req struct {
+		SampleID   string `json:"sample_id"`
+		InternalID string `json:"internal_id"`
+		Father     string `json:"father_sample_internal_id"`
+		Mother     string `json:"mother_sample_internal_id"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		ErrorBadRequest(c, err.Error())
+		return
+	}
+	result, err := h.svc.ResolveParents(req.SampleID, req.InternalID, req.Father, req.Mother, taskActorFromContext(c))
+	if err != nil {
+		ErrorBadRequest(c, err.Error())
+		return
+	}
+	Success(c, result)
+}
+func (h *SampleHandler) TrioContext(c *gin.Context) {
+	result, err := h.tasks.TrioContext(c.Param("id"), taskActorFromContext(c))
+	if err != nil {
+		ErrorNotFound(c, err.Error())
+		return
+	}
+	Success(c, result)
+}

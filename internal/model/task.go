@@ -1,0 +1,575 @@
+package model
+
+import (
+	"encoding/json"
+	"time"
+
+	"gorm.io/gorm"
+)
+
+// TaskStatus represents the status of a task
+type TaskStatus string
+
+const (
+	TaskStatusQueued                TaskStatus = "queued"
+	TaskStatusWaitingData           TaskStatus = "waiting_for_data"
+	TaskStatusRunning               TaskStatus = "running"
+	TaskStatusCompleted             TaskStatus = "completed"
+	TaskStatusFailed                TaskStatus = "failed"
+	TaskStatusCancelled             TaskStatus = "cancelled"
+	TaskStatusPendingInterpretation TaskStatus = "pending_interpretation"
+)
+
+// ResultImportStatus tracks structured result import after archive completion.
+type ResultImportStatus string
+
+const (
+	ResultImportStatusPending ResultImportStatus = "pending"
+	ResultImportStatusRunning ResultImportStatus = "running"
+	ResultImportStatusSuccess ResultImportStatus = "success"
+	ResultImportStatusFailed  ResultImportStatus = "failed"
+)
+
+// ExecutorType represents the execution environment
+type ExecutorType string
+
+const (
+	ExecutorLocal ExecutorType = "local"    // miniwdl + local.cfg
+	ExecutorSlurm ExecutorType = "slurm"    // miniwdl-slurm + slurm.cfg
+	ExecutorLSF   ExecutorType = "lsf"      // miniwdl-lsf + lsf.cfg
+	ExecutorCVM   ExecutorType = "cvm_spot" // Onykia-provisioned Tencent Cloud CVM
+)
+
+// Task represents a workflow task
+type Task struct {
+	RetryStartedAt               *time.Time `json:"retryStartedAt,omitempty" gorm:"type:timestamptz"`
+	InterpretationCompletedAt    *time.Time `json:"interpretationCompletedAt,omitempty" gorm:"type:timestamptz;index"`
+	InterpretationCompletedBy    string     `json:"interpretationCompletedBy,omitempty" gorm:"size:200"`
+	PipelineSnapshotJSON         string     `json:"-" gorm:"type:jsonb;not null;default:'{}'"`
+	Version                      uint64     `json:"-" gorm:"default:0"`
+	LastCVMEventVersion          uint64     `json:"-" gorm:"column:last_cvm_event_version;default:0"`
+	ExecutionPhase               string     `json:"execution_phase,omitempty" gorm:"size:32"`
+	ExecutionReasonCode          string     `json:"execution_reason_code,omitempty" gorm:"size:120"`
+	PhaseUpdatedAt               *time.Time `json:"phase_updated_at,omitempty"`
+	SepiidaFirstReportedAt       *time.Time `json:"-" gorm:"type:timestamptz"`
+	SepiidaFirstReportExpectedAt *time.Time `json:"-" gorm:"type:timestamptz"`
+	SepiidaQueryDegradedAt       *time.Time `json:"-" gorm:"type:timestamptz"`
+	BootstrapPhase               string     `json:"bootstrap_phase,omitempty" gorm:"size:32"`
+	BootstrapLastHeartbeatAt     *time.Time `json:"bootstrap_last_heartbeat_at,omitempty" gorm:"type:timestamptz"`
+	DiagnosticHoldUntil          *time.Time `json:"diagnostic_hold_until,omitempty" gorm:"type:timestamptz"`
+	DiagnosticSummary            string     `json:"diagnostic_summary,omitempty" gorm:"size:1000"`
+	DeleteRequestedAt            *time.Time `json:"-" gorm:"type:timestamptz"`
+
+	ID               string         `json:"id" gorm:"primaryKey"`
+	UUID             string         `json:"uuid" gorm:"uniqueIndex"` // Workflow UUID (standard format for Sepiida)
+	Name             string         `json:"name"`
+	SampleID         string         `json:"sample_id" gorm:"size:36;index"` // Sample UUID
+	PedigreeID       string         `json:"pedigree_id,omitempty" gorm:"size:36;index"`
+	InternalID       string         `json:"internal_id" gorm:"size:100"`        // Sample internal_id for display
+	UploadJobID      string         `json:"upload_job_id" gorm:"size:36;index"` // UploadJob UUID
+	Pipeline         string         `json:"pipeline" gorm:"size:200"`           // Pipeline name
+	PipelineVersion  string         `json:"pipeline_version" gorm:"size:50"`
+	Template         string         `json:"template"`            // WDL template name (internal)
+	Executor         ExecutorType   `json:"executor"`            // Execution environment (internal)
+	InputJSON        string         `json:"-" gorm:"type:jsonb"` // Input parameters JSON (internal)
+	ConfigFile       string         `json:"-"`                   // Config file path (internal)
+	OutputDir        string         `json:"-"`                   // Output directory (internal)
+	Status           TaskStatus     `json:"status" gorm:"size:30;index"`
+	Progress         int            `json:"progress" gorm:"type:smallint"` // 0-100
+	PID              int            `json:"-"`                             // Process ID (internal)
+	Remark           string         `json:"remark,omitempty" gorm:"type:text"`
+	SampleIDRef      uint           `json:"-" gorm:"index"`          // FK to samples.id (internal)
+	ProjectID        uint           `json:"-" gorm:"index"`          // FK to projects.id (internal)
+	ExternalOrgID    string         `json:"-" gorm:"size:100;index"` // optional external tenant reference for overlay events
+	TenantID         string         `json:"-" gorm:"size:160;index"` // canonical server-derived tenant scope
+	EstimatedMinutes int            `json:"-" gorm:"default:0"`      // optional runtime estimate for overlay policy
+	CreatedBy        uint           `json:"created_by" gorm:"index"`
+	StartedAt        *time.Time     `json:"started_at,omitempty" gorm:"type:timestamptz"`
+	FinishedAt       *time.Time     `json:"finished_at,omitempty" gorm:"type:timestamptz"`
+	ExpiresAt        *time.Time     `json:"expires_at,omitempty" gorm:"index;type:timestamptz"`
+	CreatedAt        time.Time      `json:"created_at" gorm:"autoCreateTime;type:timestamptz"`
+	UpdatedAt        time.Time      `json:"updated_at" gorm:"autoUpdateTime;type:timestamptz"`
+	DeletedAt        gorm.DeletedAt `json:"-" gorm:"index"`
+	Error            string         `json:"error,omitempty"`
+	LogPath          string         `json:"-"` // Log file path (internal)
+
+	// VMStatus is the lifecycle state of the provisioned VM for this task. It
+	// supersedes the legacy cvm_instances.status concept (that table is not owned
+	// by any service). Stored as a plain string enum so values can evolve
+	// without enum-type migrations; populated by the task runner / overlay events.
+	VMStatus                   string     `json:"vm_status,omitempty" gorm:"size:30;index"`
+	CVMInstanceID              string     `json:"-" gorm:"size:64;index"`
+	ExecutionAttemptID         string     `json:"execution_attempt_id,omitempty" gorm:"size:36;index"`
+	CVMDispatchNextRetryAt     *time.Time `json:"dispatch_next_retry_at,omitempty" gorm:"type:timestamptz;index"`
+	CVMDispatchRetryDeadlineAt *time.Time `json:"dispatch_retry_deadline_at,omitempty" gorm:"type:timestamptz;index"`
+	CVMDispatchRetryCount      int        `json:"dispatch_retry_count,omitempty" gorm:"default:0"`
+
+	ResultImportStatus      ResultImportStatus `json:"-" gorm:"size:30;default:'pending'"`
+	ResultImportError       string             `json:"-" gorm:"type:text"`
+	ResultImportedAt        *time.Time         `json:"-" gorm:"type:timestamptz"`
+	ResultImportStartedAt   *time.Time         `json:"-" gorm:"type:timestamptz"`
+	ResultImportFingerprint string             `json:"-" gorm:"size:64;index"`
+	ResultImportAttempts    int                `json:"-" gorm:"default:0"`
+
+	// CVM archive lifecycle is separate from workflow success. The spot VM is
+	// released only after the archive is staged and the corresponding event has
+	// been acknowledged by Onykia.
+	CVMArchiveStagedAt              *time.Time `json:"-" gorm:"type:timestamptz"`
+	CVMArchiveTerminationNotifiedAt *time.Time `json:"-" gorm:"type:timestamptz"`
+}
+
+// TaskCreateRequest is the request body for creating a task
+type TaskCreateRequest struct {
+	VCFAssetID      string `json:"vcf_asset_id"`
+	VCFSampleName   string `json:"vcf_sample_name"`
+	SampleID        string `json:"sampleId"`
+	PedigreeID      string `json:"pedigreeId"`
+	InternalID      string `json:"internalId"`
+	UploadJobID     string `json:"uploadJobId"`
+	PipelineID      string `json:"pipelineId"`
+	PipelineName    string `json:"pipelineName" binding:"required"`
+	PipelineVersion string `json:"pipelineVersion"`
+	Remark          string `json:"remark"`
+	// Internal fields (not from frontend, but used internally)
+	Template    string                  `json:"template,omitempty"`
+	Executor    ExecutorType            `json:"executor,omitempty"`
+	Inputs      map[string]interface{}  `json:"inputs,omitempty"`
+	ConfigFile  string                  `json:"config_file,omitempty"`
+	OutputDir   string                  `json:"output_dir,omitempty"`
+	InputAssets []TaskInputAssetRequest `json:"-"`
+	DeferStart  bool                    `json:"-"`
+}
+
+// TaskEstimateRequest identifies the same analysis inputs used during task
+// creation, without creating or starting a task.
+type TaskEstimateRequest struct {
+	VCFAssetID    string `json:"vcf_asset_id"`
+	VCFSampleName string `json:"vcf_sample_name"`
+	SampleID      string `json:"sampleId"`
+	PedigreeID    string `json:"pedigreeId"`
+	PipelineID    string `json:"pipelineId" binding:"required"`
+}
+
+type TaskEstimateResponse struct {
+	EstimatedMinutes int `json:"estimated_minutes"`
+}
+
+type TaskBatchInputRow struct {
+	VCFAssetID       string   `json:"vcf_asset_id"`
+	VCFSampleName    string   `json:"vcf_sample_name"`
+	RowNumber        int      `json:"row_number"`
+	SampleIdentifier string   `json:"sample_identifier"`
+	PedigreeID       string   `json:"pedigree_id"`
+	PipelineID       string   `json:"pipeline_id"`
+	Remark           string   `json:"remark"`
+	ParseErrors      []string `json:"-"`
+}
+
+type TaskBatchPreviewRow struct {
+	TaskBatchInputRow
+	SampleID         string   `json:"sample_id,omitempty"`
+	SampleInternalID string   `json:"sample_internal_id,omitempty"`
+	PipelineName     string   `json:"pipeline_name,omitempty"`
+	PipelineVersion  string   `json:"pipeline_version,omitempty"`
+	Template         string   `json:"template,omitempty"`
+	EstimatedMinutes int      `json:"estimated_minutes"`
+	Valid            bool     `json:"valid"`
+	Errors           []string `json:"errors"`
+}
+
+type TaskBatchPreviewResponse struct {
+	Rows                  []TaskBatchPreviewRow `json:"rows"`
+	TotalRows             int                   `json:"total_rows"`
+	ValidRows             int                   `json:"valid_rows"`
+	InvalidRows           int                   `json:"invalid_rows"`
+	TotalEstimatedMinutes int                   `json:"total_estimated_minutes"`
+}
+
+type TaskBatchCreateRequest struct {
+	Rows []TaskBatchInputRow `json:"rows" binding:"required"`
+}
+
+type TaskBatchCreateResult struct {
+	RowNumber int           `json:"row_number"`
+	Status    string        `json:"status"`
+	Task      *TaskResponse `json:"task,omitempty"`
+	Error     string        `json:"error,omitempty"`
+}
+
+type TaskBatchCreateResponse struct {
+	Results      []TaskBatchCreateResult `json:"results"`
+	CreatedCount int                     `json:"created_count"`
+	FailedCount  int                     `json:"failed_count"`
+	SkippedCount int                     `json:"skipped_count"`
+}
+
+// TaskUpdateRequest is the request body for updating a task
+type TaskUpdateRequest struct {
+	InternalID string `json:"internalId"`
+	Pipeline   string `json:"pipeline"`
+	Remark     string `json:"remark"`
+}
+
+// TaskListQuery is the query parameters for listing tasks
+type TaskListQuery struct {
+	Status   TaskStatus `form:"status"`
+	SampleID string     `form:"sampleId"`
+	Search   string     `form:"search"` // text across name/internal_id/error
+	// OrgID is an explicit cross-organization filter for platform-admin audit
+	// consumers. The handler still applies the caller scope before the
+	// repository uses this value, so tenant users cannot widen their access.
+	OrgID          string     `form:"org_id"`
+	CreatedSince   *time.Time `form:"created_since"` // tasks created >= since (RFC3339); nil = no filter
+	UpdatedSince   *time.Time `form:"updated_since"` // tasks updated >= since (RFC3339); nil = no filter
+	Page           int        `form:"page" binding:"omitempty,min=1"`
+	PageSize       int        `form:"page_size" binding:"omitempty,min=1,max=100"`
+	CreatedBy      uint       `json:"-" form:"-"`
+	ExternalOrgID  string     `json:"-" form:"-"`
+	TenantID       string     `json:"-" form:"-"`
+	IncludeAll     bool       `json:"-" form:"-"`
+	SharedInstance bool       `json:"-" form:"-"`
+}
+
+// TaskResponse matches frontend AnalysisTask type
+type TaskResponse struct {
+	TrioMembers []TrioMemberSnapshot `json:"trio_members,omitempty"`
+
+	ResultImportStatus        ResultImportStatus `json:"result_import_status"`
+	ResultCapabilities        []string           `json:"result_capabilities"`
+	Template                  string             `json:"template"`
+	RetryStartedAt            *time.Time         `json:"retryStartedAt,omitempty"`
+	InterpretationCompletedAt *time.Time         `json:"interpretationCompletedAt,omitempty"`
+	InterpretationCompletedBy string             `json:"interpretationCompletedBy,omitempty"`
+	ExecutionPhase            string             `json:"execution_phase,omitempty"`
+	ExecutionReasonCode       string             `json:"execution_reason_code,omitempty"`
+	AttemptID                 string             `json:"attempt_id,omitempty"`
+	PhaseUpdatedAt            *time.Time         `json:"phase_updated_at,omitempty"`
+	BootstrapPhase            string             `json:"bootstrap_phase,omitempty"`
+	BootstrapLastHeartbeatAt  *time.Time         `json:"bootstrap_last_heartbeat_at,omitempty"`
+	DiagnosticHoldUntil       *time.Time         `json:"diagnostic_hold_until,omitempty"`
+	DiagnosticSummary         string             `json:"diagnostic_summary,omitempty"`
+
+	ID                      string     `json:"id"`
+	SampleID                string     `json:"sampleId"`
+	InternalID              string     `json:"internalId"`
+	Pipeline                string     `json:"pipeline"`
+	PipelineVersion         string     `json:"pipelineVersion"`
+	Status                  TaskStatus `json:"status"`
+	VMStatus                string     `json:"vm_status,omitempty"`
+	DispatchNextRetryAt     string     `json:"dispatch_next_retry_at,omitempty"`
+	DispatchRetryDeadlineAt string     `json:"dispatch_retry_deadline_at,omitempty"`
+	DispatchRetryCount      int        `json:"dispatch_retry_count,omitempty"`
+	Progress                int        `json:"progress"`
+	ExpiresAt               *time.Time `json:"expires_at,omitempty"`
+	CreatedAt               string     `json:"created_at"`
+	CreatedBy               string     `json:"createdBy"`
+	CompletedAt             string     `json:"completedAt,omitempty"`
+	Remark                  string     `json:"remark,omitempty"`
+}
+
+// TaskDetailResponse matches frontend AnalysisTaskDetail type
+type TaskDetailResponse struct {
+	ResultImportStatus        ResultImportStatus `json:"result_import_status"`
+	ResultCapabilities        []string           `json:"result_capabilities"`
+	Template                  string             `json:"template"`
+	RetryStartedAt            *time.Time         `json:"retryStartedAt,omitempty"`
+	InterpretationCompletedAt *time.Time         `json:"interpretationCompletedAt,omitempty"`
+	InterpretationCompletedBy string             `json:"interpretationCompletedBy,omitempty"`
+	ExecutionPhase            string             `json:"execution_phase,omitempty"`
+	ExecutionReasonCode       string             `json:"execution_reason_code,omitempty"`
+	AttemptID                 string             `json:"attempt_id,omitempty"`
+	PhaseUpdatedAt            *time.Time         `json:"phase_updated_at,omitempty"`
+	BootstrapPhase            string             `json:"bootstrap_phase,omitempty"`
+	BootstrapLastHeartbeatAt  *time.Time         `json:"bootstrap_last_heartbeat_at,omitempty"`
+	DiagnosticHoldUntil       *time.Time         `json:"diagnostic_hold_until,omitempty"`
+	DiagnosticSummary         string             `json:"diagnostic_summary,omitempty"`
+
+	ID                      string     `json:"id"`
+	Name                    string     `json:"name"`
+	SampleID                string     `json:"sampleId"`
+	InternalID              string     `json:"internalId"`
+	Pipeline                string     `json:"pipeline"`
+	PipelineVersion         string     `json:"pipelineVersion"`
+	Status                  TaskStatus `json:"status"`
+	VMStatus                string     `json:"vm_status,omitempty"`
+	DispatchNextRetryAt     string     `json:"dispatch_next_retry_at,omitempty"`
+	DispatchRetryDeadlineAt string     `json:"dispatch_retry_deadline_at,omitempty"`
+	DispatchRetryCount      int        `json:"dispatch_retry_count,omitempty"`
+	ExpiresAt               *time.Time `json:"expires_at,omitempty"`
+	CreatedAt               string     `json:"created_at"`
+	CreatedBy               string     `json:"createdBy"`
+	CompletedAt             string     `json:"completedAt,omitempty"`
+}
+
+// TaskListResponse is the response for listing tasks
+type TaskListResponse struct {
+	Total int64          `json:"total"`
+	Items []TaskResponse `json:"items"`
+}
+
+// TaskAuditResponse is the enriched task shape for cross-org audit/monitoring
+// consumers (e.g. Rossia). It deliberately does NOT extend TaskResponse —
+// the frontend AnalysisTask contract must stay untouched. It exposes fields
+// Rossia's audit queries previously fetched via direct SQL on the tasks
+// table (name, executor, vm_status, result_import_*, error, started/finished).
+type TaskAuditResponse struct {
+	ID                       string             `json:"id"`
+	Name                     string             `json:"name"`
+	SampleID                 string             `json:"sampleId"`
+	InternalID               string             `json:"internalId"`
+	Pipeline                 string             `json:"pipeline"`
+	PipelineVersion          string             `json:"pipelineVersion"`
+	Executor                 ExecutorType       `json:"executor"`
+	Status                   TaskStatus         `json:"status"`
+	Progress                 int                `json:"progress"`
+	VMStatus                 string             `json:"vm_status,omitempty"`
+	ExecutionAttemptID       string             `json:"execution_attempt_id,omitempty"`
+	ExecutionPhase           string             `json:"execution_phase,omitempty"`
+	ExecutionReasonCode      string             `json:"execution_reason_code,omitempty"`
+	BootstrapPhase           string             `json:"bootstrap_phase,omitempty"`
+	BootstrapLastHeartbeatAt *time.Time         `json:"bootstrap_last_heartbeat_at,omitempty"`
+	DiagnosticHoldUntil      *time.Time         `json:"diagnostic_hold_until,omitempty"`
+	DiagnosticSummary        string             `json:"diagnostic_summary,omitempty"`
+	ResultImportStatus       ResultImportStatus `json:"result_import_status,omitempty"`
+	ResultImportAttempts     int                `json:"result_import_attempts,omitempty"`
+	Error                    string             `json:"error,omitempty"`
+	ExpiresAt                *time.Time         `json:"expires_at,omitempty"`
+	CreatedAt                string             `json:"created_at"`
+	UpdatedAt                string             `json:"updated_at,omitempty"`
+	StartedAt                string             `json:"started_at,omitempty"`
+	FinishedAt               string             `json:"finished_at,omitempty"`
+	CompletedAt              string             `json:"completedAt,omitempty"` // alias of FinishedAt for compat
+	CreatedBy                string             `json:"createdBy"`
+	OrgID                    string             `json:"org_id,omitempty"` // audit consumers need org
+	Remark                   string             `json:"remark,omitempty"`
+}
+
+// ToAuditResponse converts a Task to the enriched audit response shape.
+// It reads the result-import fields directly off the struct (the `json:"-" form:"-"`
+// tags on those fields only affect default marshalling, not field access).
+func (t *Task) ToAuditResponse() TaskAuditResponse {
+	resp := TaskAuditResponse{
+		ID:                       t.UUID,
+		Name:                     t.Name,
+		SampleID:                 t.SampleID,
+		InternalID:               t.InternalID,
+		Pipeline:                 t.Pipeline,
+		PipelineVersion:          t.PipelineVersion,
+		Executor:                 t.Executor,
+		Status:                   t.Status,
+		Progress:                 t.Progress,
+		VMStatus:                 t.VMStatus,
+		ExecutionAttemptID:       t.ExecutionAttemptID,
+		ExecutionPhase:           t.ExecutionPhase,
+		ExecutionReasonCode:      t.ExecutionReasonCode,
+		BootstrapPhase:           t.BootstrapPhase,
+		BootstrapLastHeartbeatAt: t.BootstrapLastHeartbeatAt,
+		DiagnosticHoldUntil:      t.DiagnosticHoldUntil,
+		DiagnosticSummary:        t.DiagnosticSummary,
+		ResultImportStatus:       t.ResultImportStatus,
+		ResultImportAttempts:     t.ResultImportAttempts,
+		Error:                    t.Error,
+		CreatedAt:                t.CreatedAt.Format(time.RFC3339),
+		ExpiresAt:                t.ExpiresAt,
+		UpdatedAt:                t.UpdatedAt.Format(time.RFC3339),
+		CreatedBy:                formatID(t.CreatedBy),
+		OrgID:                    t.ExternalOrgID,
+		Remark:                   t.Remark,
+	}
+	if t.StartedAt != nil {
+		resp.StartedAt = t.StartedAt.Format(time.RFC3339)
+	}
+	if t.FinishedAt != nil {
+		resp.FinishedAt = t.FinishedAt.Format(time.RFC3339)
+		resp.CompletedAt = resp.FinishedAt
+	}
+	return resp
+}
+
+// TaskAuditListResponse mirrors TaskListResponse for the audit endpoint.
+type TaskAuditListResponse struct {
+	Total int64               `json:"total"`
+	Items []TaskAuditResponse `json:"items"`
+}
+
+// TaskStatsResponse is the cross-org monitoring overview for Rossia. It
+// provides the counts Rossia's getOverview/getRiskSignals previously
+// computed via direct SQL: totals, running, failed-in-last-24h, status
+// distribution, and failed result-import batches in the last 7 days.
+type TaskStatsResponse struct {
+	TotalTasks               int            `json:"total_tasks"`
+	RunningTasks             int            `json:"running_tasks"`
+	FailedLast24h            int            `json:"failed_last_24h"`
+	StatusDistribution       map[string]int `json:"status_distribution"` // status->count (all time)
+	ResultImportFailedLast7d int            `json:"result_import_failed_last_7d"`
+	WindowStart              string         `json:"window_start"` // RFC3339 of "now-24h"
+}
+
+// TaskProgressResponse is the response for task progress
+type TaskProgressResponse struct {
+	ExecutionPhase           string     `json:"execution_phase,omitempty"`
+	ExecutionReasonCode      string     `json:"execution_reason_code,omitempty"`
+	AttemptID                string     `json:"attempt_id,omitempty"`
+	PhaseUpdatedAt           *time.Time `json:"phase_updated_at,omitempty"`
+	BootstrapPhase           string     `json:"bootstrap_phase,omitempty"`
+	BootstrapLastHeartbeatAt *time.Time `json:"bootstrap_last_heartbeat_at,omitempty"`
+	DiagnosticHoldUntil      *time.Time `json:"diagnostic_hold_until,omitempty"`
+	DiagnosticSummary        string     `json:"diagnostic_summary,omitempty"`
+
+	ID                      string             `json:"id"`
+	UUID                    string             `json:"uuid"`
+	Name                    string             `json:"name"`
+	Template                string             `json:"template"`
+	Status                  TaskStatus         `json:"status"`
+	Progress                int                `json:"progress"`
+	ExecutionAttemptID      string             `json:"execution_attempt_id,omitempty"`
+	VMStatus                string             `json:"vm_status,omitempty"`
+	DispatchNextRetryAt     *time.Time         `json:"dispatch_next_retry_at,omitempty"`
+	DispatchRetryDeadlineAt *time.Time         `json:"dispatch_retry_deadline_at,omitempty"`
+	DispatchRetryCount      int                `json:"dispatch_retry_count,omitempty"`
+	ExpiresAt               *time.Time         `json:"expires_at,omitempty"`
+	CreatedAt               time.Time          `json:"created_at"`
+	ResultImportStatus      ResultImportStatus `json:"result_import_status,omitempty"`
+	ResultImportError       string             `json:"result_import_error,omitempty"`
+	ResultImportedAt        *time.Time         `json:"result_imported_at,omitempty"`
+	ResultImportFingerprint string             `json:"result_import_fingerprint,omitempty"`
+	ResultImportAttempts    int                `json:"result_import_attempts,omitempty"`
+	SepiidaQueryUnavailable bool               `json:"sepiida_query_unavailable,omitempty"`
+	Sepiida                 *SepiidaWorkflow   `json:"sepiida,omitempty"`
+	Tasks                   []SepiidaTask      `json:"tasks,omitempty"`
+	AnalysisProgress        *AnalysisProgress  `json:"analysis_progress,omitempty"`
+	NodeLiveness            *Liveness          `json:"node_liveness,omitempty"`
+	AgentLiveness           *AgentLiveness     `json:"agent_liveness,omitempty"`
+}
+
+type AnalysisStage struct {
+	Code    string `json:"code"`
+	Label   string `json:"label"`
+	Weight  int    `json:"weight"`
+	Percent int    `json:"percent"`
+	Status  string `json:"status"`
+}
+
+type AnalysisProgress struct {
+	Percent        int             `json:"percent"`
+	ProfileVersion string          `json:"profile_version"`
+	ActiveStages   []string        `json:"active_stages"`
+	Stages         []AnalysisStage `json:"stages"`
+}
+
+type Liveness struct {
+	State      string     `json:"state"`
+	LastSeenAt *time.Time `json:"last_seen_at,omitempty"`
+}
+
+type AgentLiveness struct {
+	State              string     `json:"state"`
+	LastCollectedAt    *time.Time `json:"last_collected_at,omitempty"`
+	LastProgressPushAt *time.Time `json:"last_progress_push_at,omitempty"`
+	CollectionStatus   string     `json:"collection_status,omitempty"`
+	ErrorCode          string     `json:"error_code,omitempty"`
+}
+
+// Template represents a WDL template
+type Template struct {
+	Name          string                 `json:"name"`
+	ShortName     string                 `json:"shortName,omitempty"`
+	Domain        string                 `json:"domain,omitempty"`
+	Workflow      string                 `json:"workflow,omitempty"`
+	Path          string                 `json:"path,omitempty"`
+	Description   string                 `json:"description"`
+	InputFields   []string               `json:"input_fields,omitempty"`
+	DefaultInputs map[string]interface{} `json:"default_inputs,omitempty"`
+}
+
+// ToResponse converts Task to TaskResponse
+func (t *Task) ToResponse() TaskResponse {
+	var saved struct {
+		Members []TrioMemberSnapshot `json:"trio_members"`
+	}
+	_ = json.Unmarshal([]byte(t.InputJSON), &saved)
+	resp := TaskResponse{TrioMembers: saved.Members,
+		ResultImportStatus:        t.ResultImportStatus,
+		ResultCapabilities:        t.ResultCapabilities(),
+		Template:                  t.Template,
+		RetryStartedAt:            t.RetryStartedAt,
+		InterpretationCompletedAt: t.InterpretationCompletedAt, InterpretationCompletedBy: t.InterpretationCompletedBy,
+		ExecutionPhase: t.ExecutionPhase, ExecutionReasonCode: t.ExecutionReasonCode, AttemptID: t.ExecutionAttemptID, PhaseUpdatedAt: t.PhaseUpdatedAt,
+		BootstrapPhase: t.BootstrapPhase, BootstrapLastHeartbeatAt: t.BootstrapLastHeartbeatAt,
+		DiagnosticHoldUntil: t.DiagnosticHoldUntil, DiagnosticSummary: t.DiagnosticSummary,
+		ID:                 t.UUID,
+		SampleID:           t.SampleID,
+		InternalID:         t.InternalID,
+		Pipeline:           t.Pipeline,
+		PipelineVersion:    t.PipelineVersion,
+		Status:             t.Status,
+		VMStatus:           t.VMStatus,
+		DispatchRetryCount: t.CVMDispatchRetryCount,
+		Progress:           t.Progress,
+		CreatedAt:          t.CreatedAt.Format(time.RFC3339),
+		ExpiresAt:          t.ExpiresAt,
+		CreatedBy:          formatID(t.CreatedBy),
+		Remark:             t.Remark,
+	}
+	if t.CVMDispatchNextRetryAt != nil {
+		resp.DispatchNextRetryAt = t.CVMDispatchNextRetryAt.Format(time.RFC3339)
+	}
+	if t.CVMDispatchRetryDeadlineAt != nil {
+		resp.DispatchRetryDeadlineAt = t.CVMDispatchRetryDeadlineAt.Format(time.RFC3339)
+	}
+	if t.FinishedAt != nil {
+		resp.CompletedAt = t.FinishedAt.Format(time.RFC3339)
+	}
+	return resp
+}
+
+// ToDetailResponse converts Task to TaskDetailResponse
+func (t *Task) ToDetailResponse() TaskDetailResponse {
+	resp := TaskDetailResponse{
+		ResultImportStatus:        t.ResultImportStatus,
+		ResultCapabilities:        t.ResultCapabilities(),
+		Template:                  t.Template,
+		RetryStartedAt:            t.RetryStartedAt,
+		InterpretationCompletedAt: t.InterpretationCompletedAt, InterpretationCompletedBy: t.InterpretationCompletedBy,
+		ExecutionPhase: t.ExecutionPhase, ExecutionReasonCode: t.ExecutionReasonCode, AttemptID: t.ExecutionAttemptID, PhaseUpdatedAt: t.PhaseUpdatedAt,
+		BootstrapPhase: t.BootstrapPhase, BootstrapLastHeartbeatAt: t.BootstrapLastHeartbeatAt,
+		DiagnosticHoldUntil: t.DiagnosticHoldUntil, DiagnosticSummary: t.DiagnosticSummary,
+		ID:                 t.UUID,
+		Name:               t.Name,
+		SampleID:           t.SampleID,
+		InternalID:         t.InternalID,
+		Pipeline:           t.Pipeline,
+		PipelineVersion:    t.PipelineVersion,
+		Status:             t.Status,
+		VMStatus:           t.VMStatus,
+		DispatchRetryCount: t.CVMDispatchRetryCount,
+		CreatedAt:          t.CreatedAt.Format(time.RFC3339),
+		ExpiresAt:          t.ExpiresAt,
+		CreatedBy:          formatID(t.CreatedBy),
+	}
+	if t.CVMDispatchNextRetryAt != nil {
+		resp.DispatchNextRetryAt = t.CVMDispatchNextRetryAt.Format(time.RFC3339)
+	}
+	if t.CVMDispatchRetryDeadlineAt != nil {
+		resp.DispatchRetryDeadlineAt = t.CVMDispatchRetryDeadlineAt.Format(time.RFC3339)
+	}
+	if t.FinishedAt != nil {
+		resp.CompletedAt = t.FinishedAt.Format(time.RFC3339)
+	}
+	return resp
+}
+
+// TableName specifies the table name for Task
+func (Task) TableName() string {
+	return "tasks"
+}
+
+func (t *Task) ResultCapabilities() []string {
+	if t.Template == "vcf2anno" {
+		return []string{"snv_indel", "report", "vcf"}
+	}
+	if t.Template == "baseline_fix" || t.Template == "baseline" {
+		return []string{}
+	}
+	return []string{"snv_indel", "report", "vcf", "qc", "bam", "cnv", "str", "mei", "mt", "roh"}
+}

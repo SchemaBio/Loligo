@@ -1,0 +1,40 @@
+services:
+  loligo:
+    image: ${LOLIGO_IMAGE:-schemabio/loligo:browser-results-3}
+    environment:
+      PARQUET_ENABLED: 'true'
+      DEPLOYMENT_EDITION: saas
+      RETENTION_CLEANUP_ENABLED: ${RETENTION_CLEANUP_ENABLED:-false}
+      RETENTION_BACKUP_POLICY_VERIFIED: ${RETENTION_BACKUP_POLICY_VERIFIED:-false}
+      BAM_RETENTION_DAYS: ${BAM_RETENTION_DAYS:-7}
+      BAM_CLEANUP_ENABLED: ${BAM_CLEANUP_ENABLED:-false}
+      RESULT_ENGINE_TEMP_DIR: /data/parquet-cache/tmp
+      GOMEMLIMIT: 768MiB
+      PARQUET_CACHE_DIR: /data/parquet-cache
+      PARQUET_ASSESSMENT_DIR: /data/parquet-assessments
+    volumes:
+      - ./parquet-cache:/data/parquet-cache
+      - ./parquet-assessments:/data/parquet-assessments
+    mem_limit: 1g
+    networks:
+      - default
+      - sepiida
+    depends_on:
+      parquet-cache-init:
+        condition: service_completed_successfully
+
+  parquet-cache-init:
+    image: alpine:3.22
+    restart: 'no'
+    user: '0:0'
+    command:
+      - sh
+      - -c
+      - chown 1000:1000 /cache /assessments && chmod 0750 /cache /assessments
+    volumes:
+      - ./parquet-cache:/cache
+      - ./parquet-assessments:/assessments
+
+  zhiji:
+    image: ${ZHIJI_IMAGE:-schemabio/zhiji:browser-workspace-3}
+

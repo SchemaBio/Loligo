@@ -1,0 +1,245 @@
+package model
+
+import (
+	"encoding/json"
+	"time"
+)
+
+const (
+	OverlayAdmissionActionCreate = "create"
+	OverlayAdmissionActionStart  = "start"
+	OverlayAdmissionActionRetry  = "retry"
+)
+
+const (
+	OverlayTaskEventCreated   = "task.created"
+	OverlayTaskEventRunning   = "task.running"
+	OverlayTaskEventQueued    = "task.queued"
+	OverlayTaskEventCompleted = "task.completed"
+	// OverlayTaskEventArchiveCompleted is emitted only after Loligo has
+	// validated and staged the COS archive for the current CVM attempt.
+	OverlayTaskEventArchiveCompleted = "task.archive_completed"
+	OverlayTaskEventFailed           = "task.failed"
+	OverlayTaskEventCancelled        = "task.cancelled"
+	OverlayTaskEventStartFailed      = "task.start_failed"
+)
+
+// OverlayActor carries the authenticated principal forwarded by an overlay such
+// as Onykia. Community deployments normally populate this from the local JWT.
+type OverlayActor struct {
+	SharedInstance bool   `json:"-"`
+	OrgRole        string `json:"org_role,omitempty"`
+	UserID         uint   `json:"user_id,omitempty"`
+	Email          string `json:"email,omitempty"`
+	Role           string `json:"role,omitempty"`
+	OrgID          string `json:"org_id,omitempty"`
+}
+
+// ResourceMaintenance is restricted to the creator or a verified administrator
+// in the selected organization. It never grants access to another scope.
+func (a OverlayActor) ResourceMaintenance(owner uint) bool {
+	return a.UserID != 0 && (a.SharedInstance || a.UserID == owner || a.Role == string(SystemRoleSuperAdmin) || (a.OrgID != "" && (a.OrgRole == "ORG_ADMIN" || a.OrgRole == "PLATFORM_ADMIN")))
+}
+
+// OverlayTaskSnapshot is the stable task shape sent to external overlay policy
+// and event services. It intentionally omits local filesystem paths and inputs.
+type OverlayTaskSnapshot struct {
+	ReasonCode       string     `json:"reason_code,omitempty"`
+	Version          uint64     `json:"version,omitempty"`
+	ID               string     `json:"id"`
+	UUID             string     `json:"uuid"`
+	Name             string     `json:"name"`
+	SampleID         string     `json:"sample_id,omitempty"`
+	InternalID       string     `json:"internal_id,omitempty"`
+	Pipeline         string     `json:"pipeline,omitempty"`
+	PipelineVersion  string     `json:"pipeline_version,omitempty"`
+	Template         string     `json:"template,omitempty"`
+	Executor         string     `json:"executor,omitempty"`
+	Status           TaskStatus `json:"status"`
+	Progress         int        `json:"progress"`
+	EstimatedMinutes int        `json:"estimated_minutes,omitempty"`
+	OrgID            string     `json:"org_id,omitempty"`
+	CreatedBy        uint       `json:"created_by,omitempty"`
+	Error            string     `json:"error,omitempty"`
+	CreatedAt        time.Time  `json:"created_at"`
+	StartedAt        *time.Time `json:"started_at,omitempty"`
+	FinishedAt       *time.Time `json:"finished_at,omitempty"`
+	AttemptID        string     `json:"attempt_id,omitempty"`
+}
+
+// NewOverlayTaskSnapshot converts a task to the overlay contract.
+func NewOverlayTaskSnapshot(task *Task) OverlayTaskSnapshot {
+	if task == nil {
+		return OverlayTaskSnapshot{}
+	}
+	return OverlayTaskSnapshot{
+		Version: task.Version, ReasonCode: task.ExecutionReasonCode,
+		ID:               task.ID,
+		UUID:             task.UUID,
+		Name:             task.Name,
+		SampleID:         task.SampleID,
+		InternalID:       task.InternalID,
+		Pipeline:         task.Pipeline,
+		PipelineVersion:  task.PipelineVersion,
+		Template:         task.Template,
+		Executor:         string(task.Executor),
+		Status:           task.Status,
+		Progress:         task.Progress,
+		EstimatedMinutes: task.EstimatedMinutes,
+		OrgID:            task.ExternalOrgID,
+		CreatedBy:        task.CreatedBy,
+		Error:            task.Error,
+		CreatedAt:        task.CreatedAt,
+		StartedAt:        task.StartedAt,
+		FinishedAt:       task.FinishedAt,
+		AttemptID:        task.ExecutionAttemptID,
+	}
+}
+
+// OverlayTaskAdmissionRequest asks an external policy plane whether a task
+// operation may proceed.
+type OverlayTaskAdmissionRequest struct {
+	Action      string              `json:"action"`
+	Actor       OverlayActor        `json:"actor"`
+	Task        OverlayTaskSnapshot `json:"task"`
+	RequestedAt time.Time           `json:"requested_at"`
+}
+
+// OverlayTaskAdmissionResponse is returned by the external policy plane.
+type OverlayTaskAdmissionResponse struct {
+	Allowed  bool                   `json:"allowed"`
+	Reason   string                 `json:"reason,omitempty"`
+	Metadata map[string]interface{} `json:"metadata,omitempty"`
+}
+
+// OverlayTaskEventRequest notifies an external control plane about task state
+// changes. Delivery is best effort and must not be required for community mode.
+type OverlayTaskEventRequest struct {
+	EventID        string              `json:"event_id,omitempty"`
+	Version        uint64              `json:"version,omitempty"`
+	Event          string              `json:"event"`
+	Actor          OverlayActor        `json:"actor"`
+	Task           OverlayTaskSnapshot `json:"task"`
+	PreviousStatus TaskStatus          `json:"previous_status,omitempty"`
+	OccurredAt     time.Time           `json:"occurred_at"`
+	Message        string              `json:"message,omitempty"`
+}
+
+type CVMInputDownload struct {
+	ObjectKey         string `json:"object_key"`
+	URL               string `json:"url"`
+	Target            string `json:"target"`
+	ExpectedSizeBytes int64  `json:"expected_size_bytes,omitempty"`
+	ValidationRole    string `json:"validation_role,omitempty"`
+	PairKey           string `json:"pair_key,omitempty"`
+}
+
+type CVMInlineFile struct {
+	Target  string `json:"target"`
+	Content string `json:"content"`
+}
+
+type CVMExecutionSpec struct {
+	Template                string             `json:"template"`
+	ReferenceGenome         string             `json:"reference_genome"`
+	WorkflowContractVersion string             `json:"workflow_contract_version"`
+	Inputs                  json.RawMessage    `json:"inputs"`
+	Downloads               []CVMInputDownload `json:"downloads,omitempty"`
+	InlineFiles             []CVMInlineFile    `json:"inline_files,omitempty"`
+}
+
+type CVMDispatchRequest struct {
+	Actor       OverlayActor        `json:"actor"`
+	Task        OverlayTaskSnapshot `json:"task"`
+	AttemptID   string              `json:"attempt_id"`
+	Execution   CVMExecutionSpec    `json:"execution"`
+	RequestedAt time.Time           `json:"requested_at"`
+}
+
+// CVMInputRefreshRequest/Response are internal control-plane messages used
+// by Onykia before a queued spot retry. They are authenticated by the same
+// service secret as CVM lifecycle callbacks and never reach the browser.
+type CVMInputRefreshRequest struct {
+	TaskUUID                string `json:"task_uuid"`
+	AttemptID               string `json:"attempt_id"`
+	WorkflowContractVersion string `json:"workflow_contract_version,omitempty"`
+}
+
+type CVMInputRefreshResponse struct {
+	TaskUUID  string           `json:"task_uuid"`
+	AttemptID string           `json:"attempt_id"`
+	Execution CVMExecutionSpec `json:"execution"`
+}
+
+type CVMDispatchResponse struct {
+	Accepted        bool       `json:"accepted"`
+	AttemptID       string     `json:"attempt_id"`
+	InstanceID      string     `json:"instance_id,omitempty"`
+	InstanceState   string     `json:"instance_state,omitempty"`
+	Reason          string     `json:"reason,omitempty"`
+	RetryAt         *time.Time `json:"retry_at,omitempty"`
+	RetryDeadlineAt *time.Time `json:"retry_deadline_at,omitempty"`
+	RetryCount      int        `json:"retry_count,omitempty"`
+}
+
+type CVMCancelRequest struct {
+	Actor     OverlayActor `json:"actor"`
+	TaskUUID  string       `json:"task_uuid"`
+	AttemptID string       `json:"attempt_id,omitempty"`
+	Reason    string       `json:"reason,omitempty"`
+}
+
+type CVMStateEvent struct {
+	EventID           string     `json:"event_id,omitempty"`
+	Version           uint64     `json:"version,omitempty"`
+	ExecutionPhase    string     `json:"execution_phase,omitempty"`
+	ReasonCode        string     `json:"reason_code,omitempty"`
+	BootstrapPhase    string     `json:"bootstrap_phase,omitempty"`
+	DiagnosticSummary string     `json:"diagnostic_summary,omitempty"`
+	TaskUUID          string     `json:"task_uuid"`
+	AttemptID         string     `json:"attempt_id"`
+	InstanceID        string     `json:"instance_id,omitempty"`
+	InstanceState     string     `json:"instance_state"`
+	TaskStatus        TaskStatus `json:"task_status,omitempty"`
+	Message           string     `json:"message,omitempty"`
+	// Onykia includes the durable attempt timestamps so a cancellation that
+	// reconciles an instance after an unknown dispatch can be billed by actual
+	// runtime even if Loligo never observed a separate running event.
+	StartedAt           *time.Time `json:"started_at,omitempty"`
+	FinishedAt          *time.Time `json:"finished_at,omitempty"`
+	LastHeartbeatAt     *time.Time `json:"last_heartbeat_at,omitempty"`
+	DiagnosticFailureAt *time.Time `json:"diagnostic_failure_at,omitempty"`
+	DiagnosticHoldUntil *time.Time `json:"diagnostic_hold_until,omitempty"`
+	RetryAt             *time.Time `json:"retry_at,omitempty"`
+	RetryDeadlineAt     *time.Time `json:"retry_deadline_at,omitempty"`
+	RetryCount          int        `json:"retry_count,omitempty"`
+	OccurredAt          time.Time  `json:"occurred_at"`
+}
+
+type OverlayCreditChargeRequest struct {
+	Actor       OverlayActor `json:"actor"`
+	OrgID       string       `json:"org_id,omitempty"`
+	ReferenceID string       `json:"reference_id"`
+	Credits     int          `json:"credits,omitempty"`
+	BillingCode string       `json:"billing_code,omitempty"`
+	Quantity    int          `json:"quantity,omitempty"`
+	Description string       `json:"description,omitempty"`
+}
+
+type OverlayCreditRefundRequest struct {
+	Actor       OverlayActor `json:"actor"`
+	OrgID       string       `json:"org_id,omitempty"`
+	ReferenceID string       `json:"reference_id"`
+}
+
+type OverlayCreditResponse struct {
+	Allowed        bool   `json:"allowed"`
+	Reason         string `json:"reason,omitempty"`
+	Balance        int    `json:"balance,omitempty"`
+	CreditsCharged int    `json:"credits_charged,omitempty"`
+}
+
+const BillingCodeCNVBaselineInput = "cnv_baseline_input_gib"
+
+const BillingCodeResultZIP = "result_zip_download"
+const BillingCodeResultBAM = "result_bam_download_gb"

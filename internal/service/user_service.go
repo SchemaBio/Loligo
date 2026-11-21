@@ -1,0 +1,468 @@
+package service
+
+import (
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"errors"
+	"fmt"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/SchemaBio/Loligo/internal/config"
+	"github.com/SchemaBio/Loligo/internal/model"
+	"github.com/SchemaBio/Loligo/internal/repository"
+)
+
+// UserService handles user business logic
+type UserService struct {
+	cfg    *config.Config
+	repo   *repository.UserRepository
+	jwtSvc *JWTService
+}
+
+// NewUserService creates a new user service
+func NewUserService(cfg *config.Config) *UserService {
+	return &UserService{
+		cfg:    cfg,
+		repo:   repository.NewUserRepository(),
+		jwtSvc: NewJWTService(cfg),
+	}
+}
+
+func tokenClaimsMatchUser(claims *Claims, user *model.User) bool {
+	if claims.TokenVersion <= 0 {
+		return false
+	}
+	return claims.UserID == user.ID &&
+		claims.Email == user.Email &&
+		claims.Role == string(user.SystemRole) &&
+		claims.TokenVersion == EffectiveTokenVersion(user.TokenVersion)
+}
+
+func resetTokenDigest(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return fmt.Sprintf("%x", sum[:])
+}
+
+func newResetToken() (string, error) {
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(buf), nil
+}
+
+// Login authenticates user by email and returns tokens
+func (s *UserService) Login(email, password string) (*model.LoginResponse, error) {
+	// Find user by email
+	user, err := s.repo.FindByEmail(email)
+	if err != nil {
+		return nil, errors.New("invalid email or password")
+	}
+
+	// Check password (with optional client-side hash)
+	preparedPassword := PreparePassword(password, email, s.cfg.JWT.ClientPasswordHashEnabled)
+	if !CheckPassword(preparedPassword, user.Password) {
+		return nil, errors.New("invalid email or password")
+	}
+
+	if user.ApprovalStatus == model.ApprovalStatusPending ||
+		user.ApprovalStatus == model.ApprovalStatusRejected ||
+		!user.IsActive {
+		return nil, errors.New("invalid email or password")
+	}
+
+	// Generate tokens
+	accessToken, refreshToken, expiresAt, err := s.jwtSvc.GenerateToken(user)
+	if err != nil {
+		return nil, errors.New("failed to generate token")
+	}
+
+	// Build response
+	userResp := model.UserToResponse(user)
+
+	return &model.LoginResponse{
+		User:          userResp,
+		Organizations: []model.OrganizationInfo{},
+		AccessToken:   accessToken,
+		RefreshToken:  refreshToken,
+		ExpiresAt:     expiresAt,
+	}, nil
+}
+
+// Register creates a new user account
+func (s *UserService) Register(req *model.RegisterRequest) (*model.LoginResponse, error) {
+	// Check if email exists
+	if s.repo.ExistsByEmail(req.Email) {
+		return nil, errors.New("email already exists")
+	}
+	if err := ValidatePasswordStrength(req.Password); err != nil {
+		return nil, err
+	}
+
+	// Hash password (with optional client-side hash)
+	preparedPassword := PreparePassword(req.Password, req.Email, s.cfg.JWT.ClientPasswordHashEnabled)
+	hashedPassword, err := HashPassword(preparedPassword)
+	if err != nil {
+		return nil, errors.New("failed to hash password")
+	}
+
+	// Create user with email as username (internal)
+	user := &model.User{
+		Username:       req.Email,
+		Password:       hashedPassword,
+		Email:          req.Email,
+		Name:           req.Name,
+		SystemRole:     model.SystemRoleUser,
+		IsActive:       true,
+		ApprovalStatus: model.ApprovalStatusApproved,
+		TokenVersion:   1,
+	}
+
+	if err := s.repo.Create(user); err != nil {
+		return nil, errors.New("failed to create user")
+	}
+
+	// Generate tokens
+	accessToken, refreshToken, expiresAt, err := s.jwtSvc.GenerateToken(user)
+	if err != nil {
+		return nil, errors.New("failed to generate token")
+	}
+
+	userResp := model.UserToResponse(user)
+
+	return &model.LoginResponse{
+		User:          userResp,
+		Organizations: []model.OrganizationInfo{},
+		AccessToken:   accessToken,
+		RefreshToken:  refreshToken,
+		ExpiresAt:     expiresAt,
+	}, nil
+}
+
+// ListPendingUsers returns accounts awaiting administrator approval.
+func (s *UserService) ListPendingUsers() ([]model.UserResponse, error) {
+	users, err := s.repo.FindByApprovalStatus(model.ApprovalStatusPending)
+	if err != nil {
+		return nil, err
+	}
+
+	items := make([]model.UserResponse, len(users))
+	for i := range users {
+		items[i] = model.UserToResponse(&users[i])
+	}
+	return items, nil
+}
+
+// ApproveUser activates a pending account.
+func (s *UserService) ApproveUser(id uint) error {
+	user, err := s.repo.FindByID(id)
+	if err != nil {
+		return err
+	}
+	if user.ApprovalStatus != model.ApprovalStatusPending {
+		return errors.New("user is not pending approval")
+	}
+	return s.repo.UpdateApprovalStatus(id, model.ApprovalStatusApproved, true)
+}
+
+// RejectUser disables a pending account without deleting its history.
+func (s *UserService) RejectUser(id uint) error {
+	user, err := s.repo.FindByID(id)
+	if err != nil {
+		return err
+	}
+	if user.ApprovalStatus != model.ApprovalStatusPending {
+		return errors.New("user is not pending approval")
+	}
+	return s.repo.UpdateApprovalStatus(id, model.ApprovalStatusRejected, false)
+}
+
+// RefreshToken refreshes access token
+func (s *UserService) RefreshToken(refreshToken string) (*model.RefreshResponse, error) {
+	claims, err := s.jwtSvc.ValidateRefreshToken(refreshToken)
+	if err != nil {
+		return nil, errors.New("invalid refresh token")
+	}
+
+	user, err := s.repo.FindByID(claims.UserID)
+	if err != nil || !user.IsActive || !tokenClaimsMatchUser(claims, user) {
+		return nil, errors.New("invalid refresh token")
+	}
+
+	token, newRefreshToken, expiresAt, err := s.jwtSvc.GenerateToken(user)
+	if err != nil {
+		return nil, errors.New("failed to generate token")
+	}
+
+	return &model.RefreshResponse{
+		AccessToken:  token,
+		RefreshToken: newRefreshToken,
+		ExpiresAt:    expiresAt,
+	}, nil
+}
+
+// GetUserByID gets user by ID
+func (s *UserService) GetUserByID(id uint) (*model.User, error) {
+	return s.repo.FindByID(id)
+}
+
+// GetUserByEmail gets user by email
+func (s *UserService) GetUserByEmail(email string) (*model.User, error) {
+	return s.repo.FindByEmail(email)
+}
+
+// CreateDefaultAdmin creates default admin user if not exists
+func (s *UserService) CreateDefaultAdmin(email, password, name string) (*model.User, error) {
+	// Check if admin exists by email
+	if s.repo.ExistsByEmail(email) {
+		user, err := s.repo.FindByEmail(email)
+		if err != nil {
+			return nil, err
+		}
+		if user.SystemRole != model.SystemRoleSuperAdmin || !user.IsActive {
+			return nil, errors.New("DEFAULT_ADMIN_EMAIL already belongs to a non-active or non-admin account")
+		}
+		return user, nil
+	}
+
+	preparedPassword := PreparePassword(password, email, s.cfg.JWT.ClientPasswordHashEnabled)
+	hashedPassword, err := HashPassword(preparedPassword)
+	if err != nil {
+		return nil, err
+	}
+
+	admin := &model.User{
+		Username:       email,
+		Password:       hashedPassword,
+		Email:          email,
+		Name:           name,
+		SystemRole:     model.SystemRoleSuperAdmin,
+		IsActive:       true,
+		ApprovalStatus: model.ApprovalStatusApproved,
+		TokenVersion:   1,
+	}
+
+	if err := s.repo.Create(admin); err != nil {
+		return nil, err
+	}
+
+	return admin, nil
+}
+
+// ListUsers lists users with pagination
+func (s *UserService) ListUsers(query *model.UserListQuery) (*model.UserListResponse, error) {
+	users, total, err := s.repo.PaginateByQuery(query)
+	if err != nil {
+		return nil, err
+	}
+
+	items := make([]model.UserResponse, len(users))
+	for i, u := range users {
+		items[i] = model.UserToResponse(&u)
+	}
+
+	return &model.UserListResponse{
+		Total: total,
+		Items: items,
+	}, nil
+}
+
+// CreateManagedUser persists credentials, role and grants in one insert.
+func (s *UserService) CreateManagedUser(req *model.UserCreateRequest) (*model.User, error) {
+	if req.SystemRole != "" && req.SystemRole != model.SystemRoleUser && req.SystemRole != model.SystemRoleSuperAdmin {
+		return nil, errors.New("invalid system role")
+	}
+	permissions := []string{}
+	if req.Permissions != nil {
+		var err error
+		permissions, err = model.NormalizePermissions(*req.Permissions)
+		if err != nil {
+			return nil, err
+		}
+	}
+	email := strings.ToLower(strings.TrimSpace(req.Email))
+	if s.repo.ExistsByEmail(email) {
+		return nil, errors.New("email already exists")
+	}
+	if err := ValidatePasswordStrength(req.Password); err != nil {
+		return nil, err
+	}
+	hashed, err := HashPassword(PreparePassword(req.Password, email, s.cfg.JWT.ClientPasswordHashEnabled))
+	if err != nil {
+		return nil, errors.New("failed to hash password")
+	}
+	role := req.SystemRole
+	if role == "" {
+		role = model.SystemRoleUser
+	}
+	user := &model.User{Username: email, Email: email, Name: strings.TrimSpace(req.Name), Password: hashed, SystemRole: role, Permissions: permissions, IsActive: true, ApprovalStatus: model.ApprovalStatusApproved, TokenVersion: 1}
+	if err := s.repo.Create(user); err != nil {
+		return nil, err
+	}
+	return user, nil
+}
+
+// UpdateUser updates user information
+func (s *UserService) UpdateUser(id uint, req *model.UserUpdateRequest) (*model.User, error) {
+	user, err := s.repo.FindByID(id)
+	if err != nil {
+		return nil, err
+	}
+
+	permissionsChanged := req.Permissions != nil || (user.SystemRole == model.SystemRoleSuperAdmin && req.SystemRole == model.SystemRoleUser)
+	if req.Permissions != nil {
+		values, err := model.NormalizePermissions(*req.Permissions)
+		if err != nil {
+			return nil, err
+		}
+		user.Permissions = values
+	} else if user.SystemRole == model.SystemRoleSuperAdmin && req.SystemRole == model.SystemRoleUser {
+		user.Permissions = []string{}
+	}
+	if req.Name != "" {
+		user.Name = req.Name
+	}
+	if req.SystemRole != "" {
+		user.SystemRole = req.SystemRole
+	}
+	if req.IsActive != nil {
+		user.IsActive = *req.IsActive
+	}
+
+	if err := s.repo.UpdateManagedFields(user, req, permissionsChanged); err != nil {
+		return nil, err
+	}
+
+	return user, nil
+}
+
+// UpdateProfile updates fields a user is allowed to change for their own account.
+func (s *UserService) UpdateProfile(id uint, req *model.ProfileUpdateRequest) (*model.User, error) {
+	user, err := s.repo.FindByID(id)
+	if err != nil {
+		return nil, err
+	}
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		return nil, errors.New("name is required")
+	}
+	if len([]rune(name)) > 100 {
+		return nil, errors.New("name is too long")
+	}
+	user.Name = name
+	if err := s.repo.UpdateProfileName(user.ID, name); err != nil {
+		return nil, err
+	}
+	return user, nil
+}
+
+// DeleteUser deletes a user
+func (s *UserService) DeleteUser(id uint) error {
+	return s.repo.Delete(id)
+}
+
+// ChangePassword changes user password
+func (s *UserService) ChangePassword(id uint, oldPassword, newPassword string) error {
+	user, err := s.repo.FindByID(id)
+	if err != nil {
+		return err
+	}
+
+	preparedOld := PreparePassword(oldPassword, user.Email, s.cfg.JWT.ClientPasswordHashEnabled)
+	if !CheckPassword(preparedOld, user.Password) {
+		return errors.New("invalid old password")
+	}
+	if err := ValidatePasswordStrength(newPassword); err != nil {
+		return err
+	}
+
+	preparedNew := PreparePassword(newPassword, user.Email, s.cfg.JWT.ClientPasswordHashEnabled)
+	hashedPassword, err := HashPassword(preparedNew)
+	if err != nil {
+		return err
+	}
+
+	return s.repo.UpdatePassword(id, hashedPassword)
+}
+
+// RevokeUserTokens invalidates all existing access and refresh tokens for a user.
+func (s *UserService) RevokeUserTokens(id uint) error {
+	return s.repo.IncrementTokenVersion(id)
+}
+
+// RevokeToken invalidates the session represented by a current access or refresh token.
+func (s *UserService) RevokeToken(token string) error {
+	claims, err := s.jwtSvc.ValidateToken(token)
+	if err != nil {
+		return err
+	}
+	user, err := s.repo.FindByID(claims.UserID)
+	if err != nil {
+		return err
+	}
+	if !tokenClaimsMatchUser(claims, user) {
+		return errors.New("token is no longer current")
+	}
+	return s.repo.IncrementTokenVersion(user.ID)
+}
+
+func passwordResetDeliveryEnabled() bool {
+	return os.Getenv("SMTP_ENABLED") == "true" || strings.TrimSpace(os.Getenv("SMTP_URL")) != ""
+}
+
+// GenerateResetToken creates a password reset token for a user.
+func (s *UserService) GenerateResetToken(email string) (string, error) {
+	email = strings.ToLower(strings.TrimSpace(email))
+	if !passwordResetDeliveryEnabled() {
+		return "", nil
+	}
+	user, err := s.repo.FindByEmail(email)
+	if err != nil {
+		return "", nil
+	}
+
+	token, err := newResetToken()
+	if err != nil {
+		return "", err
+	}
+	expiry := time.Now().Add(1 * time.Hour)
+	user.ResetToken = resetTokenDigest(token)
+	user.ResetTokenExpiry = &expiry
+
+	if err := s.repo.Update(user); err != nil {
+		return "", err
+	}
+
+	return token, nil
+}
+
+// ResetPassword resets password using a reset token.
+func (s *UserService) ResetPassword(token, newPassword string) error {
+	user, err := s.repo.FindByResetToken(resetTokenDigest(token))
+	if err != nil {
+		return errors.New("invalid or expired reset token")
+	}
+
+	if user.ResetTokenExpiry == nil || time.Now().After(*user.ResetTokenExpiry) {
+		return errors.New("reset token has expired")
+	}
+	if err := ValidatePasswordStrength(newPassword); err != nil {
+		return err
+	}
+
+	preparedPassword := PreparePassword(newPassword, user.Email, s.cfg.JWT.ClientPasswordHashEnabled)
+	hashedPassword, err := HashPassword(preparedPassword)
+	if err != nil {
+		return err
+	}
+
+	user.Password = hashedPassword
+	user.ResetToken = ""
+	user.ResetTokenExpiry = nil
+	user.TokenVersion = EffectiveTokenVersion(user.TokenVersion) + 1
+
+	return s.repo.Update(user)
+}

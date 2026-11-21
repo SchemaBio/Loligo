@@ -1,0 +1,302 @@
+package handler
+
+import (
+	"errors"
+	"fmt"
+	"io"
+	"mime"
+	"net/http"
+	"strings"
+
+	"github.com/SchemaBio/Loligo/internal/config"
+	"github.com/SchemaBio/Loligo/internal/middleware"
+	"github.com/SchemaBio/Loligo/internal/model"
+	"github.com/SchemaBio/Loligo/internal/repository"
+	"github.com/SchemaBio/Loligo/internal/service"
+	"github.com/gin-gonic/gin"
+)
+
+type ReportHandler struct {
+	svc      *service.ReportService
+	taskRepo *repository.TaskRepository
+}
+
+func NewReportHandler(cfg *config.Config) *ReportHandler {
+	return &ReportHandler{
+		svc:      service.NewReportService(cfg),
+		taskRepo: repository.NewTaskRepository(),
+	}
+}
+
+// ListReports returns all legacy persisted reports for a task.
+func (h *ReportHandler) ListReports(c *gin.Context) {
+	taskID := c.Param("id")
+	if _, ok := requireTaskAccess(c, h.taskRepo, taskID); !ok {
+		return
+	}
+
+	reports, err := h.svc.ListByTaskID(taskID)
+	if err != nil {
+		ErrorInternal(c, err.Error())
+		return
+	}
+
+	Success(c, reports)
+}
+
+// CreateReport triggers report generation and streams the generated file.
+func (h *ReportHandler) CreateReport(c *gin.Context) {
+	taskID := c.Param("id")
+	task, ok := requireTaskAccess(c, h.taskRepo, taskID)
+	if !ok {
+		return
+	}
+
+	var req model.ReportCreateRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		ErrorBadRequest(c, err.Error())
+		return
+	}
+
+	_, _, _, ok = middleware.GetCurrentUser(c)
+	if !ok {
+		ErrorUnauthorized(c, "Unauthorized")
+		return
+	}
+
+	download, err := h.svc.GenerateScopedReportDownload(c.Request.Context(), taskActorFromContext(c), task, &req)
+	if err != nil {
+		if errors.Is(err, service.ErrResourceConflict) {
+			ErrorConflict(c, err.Error())
+			return
+		}
+		if errors.Is(err, service.ErrResultPackageNotReady) {
+			c.JSON(http.StatusConflict, gin.H{"error": service.ErrResultPackageNotReady.Error(), "detail": err.Error()})
+			return
+		}
+		ErrorBadRequest(c, err.Error())
+		return
+	}
+	defer download.Body.Close()
+
+	c.Header("Content-Type", download.ContentType)
+	c.Header("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": download.FileName}))
+	c.Header("Cache-Control", "no-store")
+	if download.ContentLength >= 0 {
+		c.Header("Content-Length", fmt.Sprintf("%d", download.ContentLength))
+	}
+	c.Status(http.StatusOK)
+	if _, err := io.Copy(c.Writer, download.Body); err != nil {
+		if errors.Is(err, service.ErrReportDownloadTooLarge) {
+			c.Error(fmt.Errorf("report download aborted: %w", err))
+			return
+		}
+		c.Error(err)
+	}
+}
+
+// UploadReport is disabled in direct-download report mode.
+func (h *ReportHandler) UploadReport(c *gin.Context) {
+	taskID := c.Param("id")
+	if _, ok := requireTaskAccess(c, h.taskRepo, taskID); !ok {
+		return
+	}
+
+	ErrorGone(c, "uploaded reports are disabled; generate reports through the configured report API")
+}
+
+// UpdateReportStatus is disabled in direct-download report mode.
+func (h *ReportHandler) UpdateReportStatus(c *gin.Context) {
+	taskID := c.Param("id")
+	if _, ok := requireTaskAccess(c, h.taskRepo, taskID); !ok {
+		return
+	}
+
+	ErrorGone(c, "stored report workflow is disabled; generate reports through the configured report API")
+}
+
+// DeleteReport is disabled in direct-download report mode.
+func (h *ReportHandler) DeleteReport(c *gin.Context) {
+	taskID := c.Param("id")
+	if _, ok := requireTaskAccess(c, h.taskRepo, taskID); !ok {
+		return
+	}
+
+	ErrorGone(c, "stored report records are disabled; generate reports through the configured report API")
+}
+
+// GetReportDownloadURL is disabled in direct-download report mode.
+func (h *ReportHandler) GetReportDownloadURL(c *gin.Context) {
+	taskID := c.Param("id")
+	if _, ok := requireTaskAccess(c, h.taskRepo, taskID); !ok {
+		return
+	}
+
+	ErrorGone(c, "stored report downloads are disabled; generate reports through the configured report API")
+}
+
+// ListTemplates returns active report templates.
+func (h *ReportHandler) ListTemplates(c *gin.Context) {
+	userID, _, _, ok := middleware.GetCurrentUser(c)
+	if !ok {
+		ErrorUnauthorized(c, "Unauthorized")
+		return
+	}
+	if c.Query("include_inactive") == "true" {
+		templates, err := h.svc.ListTemplatesForOwner(userID, taskActorFromContext(c))
+		if err != nil {
+			ErrorInternal(c, err.Error())
+			return
+		}
+		Success(c, templates)
+		return
+	}
+
+	templates, err := h.svc.ListActiveTemplates(userID, taskActorFromContext(c))
+	if err != nil {
+		ErrorInternal(c, err.Error())
+		return
+	}
+
+	Success(c, templates)
+}
+
+// CreateTemplate creates a new report template.
+func (h *ReportHandler) CreateTemplate(c *gin.Context) {
+	userID, _, _, ok := middleware.GetCurrentUser(c)
+	if !ok {
+		ErrorUnauthorized(c, "Unauthorized")
+		return
+	}
+	var req model.ReportTemplateCreateRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		ErrorBadRequest(c, err.Error())
+		return
+	}
+
+	tmpl, err := h.svc.CreateTemplate(userID, &req, taskActorFromContext(c))
+	if err != nil {
+		writeReportTemplateError(c, err)
+		return
+	}
+
+	SuccessCreated(c, tmpl)
+}
+
+func (h *ReportHandler) ValidateTemplateEndpoint(c *gin.Context) {
+	userID, _, _, ok := middleware.GetCurrentUser(c)
+	if !ok {
+		ErrorUnauthorized(c, "Unauthorized")
+		return
+	}
+	var req model.ReportEndpointValidateRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		ErrorBadRequest(c, err.Error())
+		return
+	}
+	status, err := h.svc.ValidateOwnedTemplateEndpoint(c.Request.Context(), userID, req.TemplateID, req.APIEndpoint, req.APIKey, taskActorFromContext(c))
+	if err != nil {
+		ErrorBadRequest(c, err.Error())
+		return
+	}
+	Success(c, gin.H{"reachable": true, "status_code": status, "authenticated": status >= 200 && status < 300, "protocol_verified": false, "head_supported": status != 405})
+}
+
+// UpdateTemplate updates a report template.
+func (h *ReportHandler) UpdateTemplate(c *gin.Context) {
+	userID, _, _, ok := middleware.GetCurrentUser(c)
+	if !ok {
+		ErrorUnauthorized(c, "Unauthorized")
+		return
+	}
+	var req model.ReportTemplateUpdateRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		ErrorBadRequest(c, err.Error())
+		return
+	}
+
+	tmpl, err := h.svc.UpdateTemplate(userID, c.Param("id"), &req, taskActorFromContext(c))
+	if err != nil {
+		writeReportTemplateError(c, err)
+		return
+	}
+
+	Success(c, tmpl)
+}
+
+// UpdateTemplateStatus toggles a report template's active state.
+func (h *ReportHandler) UpdateTemplateStatus(c *gin.Context) {
+	userID, _, _, ok := middleware.GetCurrentUser(c)
+	if !ok {
+		ErrorUnauthorized(c, "Unauthorized")
+		return
+	}
+	var req model.ReportTemplateStatusRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		ErrorBadRequest(c, err.Error())
+		return
+	}
+
+	tmpl, err := h.svc.SetTemplateActive(userID, c.Param("id"), req.IsActive, taskActorFromContext(c))
+	if err != nil {
+		writeReportTemplateError(c, err)
+		return
+	}
+
+	Success(c, tmpl)
+}
+
+// DeleteTemplate deletes an inactive report template.
+func (h *ReportHandler) DeleteTemplate(c *gin.Context) {
+	userID, _, _, ok := middleware.GetCurrentUser(c)
+	if !ok {
+		ErrorUnauthorized(c, "Unauthorized")
+		return
+	}
+	if err := h.svc.DeleteTemplate(userID, c.Param("id"), taskActorFromContext(c)); err != nil {
+		writeReportTemplateError(c, err)
+		return
+	}
+	c.Status(http.StatusNoContent)
+}
+
+func writeReportTemplateError(c *gin.Context, err error) {
+	switch {
+	case errors.Is(err, service.ErrReportTemplateNotFound):
+		ErrorNotFound(c, err.Error())
+	case errors.Is(err, service.ErrResourceConflict), errors.Is(err, service.ErrReportTemplateNameExists):
+		ErrorConflict(c, err.Error())
+	case errors.Is(err, service.ErrReportTemplateActive):
+		ErrorBadRequest(c, err.Error())
+	case strings.Contains(err.Error(), "only report-snapshot-v2 is supported") || strings.Contains(err.Error(), "report API endpoint") || strings.Contains(err.Error(), "authentication key") || strings.Contains(err.Error(), "name is required") || strings.Contains(err.Error(), "API key is required") || strings.Contains(err.Error(), "templateId is required"):
+		ErrorBadRequest(c, err.Error())
+	default:
+		ErrorInternal(c, err.Error())
+	}
+}
+
+func (h *ReportHandler) Generations(c *gin.Context) {
+	t, ok := requireTaskAccess(c, h.taskRepo, c.Param("id"))
+	if !ok {
+		return
+	}
+	rows, e := h.svc.ListGenerations(c.Request.Context(), t)
+	if e != nil {
+		ErrorInternal(c, "report records unavailable")
+		return
+	}
+	Success(c, rows)
+}
+
+func (h *ReportHandler) Preview(c *gin.Context) {
+	t, ok := requireTaskAccess(c, h.taskRepo, c.Param("id"))
+	if !ok {
+		return
+	}
+	r, e := h.svc.PreviewReport(c.Request.Context(), t)
+	if e != nil {
+		ErrorConflict(c, e.Error())
+		return
+	}
+	Success(c, r)
+}

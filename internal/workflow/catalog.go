@@ -1,0 +1,261 @@
+package workflow
+
+import (
+	"encoding/json"
+	"fmt"
+	"path"
+	"sort"
+	"strings"
+
+	"github.com/SchemaBio/Loligo/internal/model"
+)
+
+// ImageWorkflowDir is the default WDL workflow directory inside the CVM image.
+const ImageWorkflowDir = "/home/ubuntu/schema-germline"
+
+// ContractVersion identifies the input shape expected by the workflow bundle
+// baked into the SaaS CVM image. Keep this in the dispatch contract so an
+// image/catalog mismatch is rejected before a spot instance is created.
+const ContractVersion = "germline-v2"
+
+// Definition describes a workflow template.
+type Definition struct {
+	Name        string
+	ShortName   string
+	Domain      string
+	Workflow    string
+	Description string
+	Inputs      map[string]interface{}
+}
+
+var definitions = map[string]Definition{
+	"germline_vcf2anno": {Name: "germline_vcf2anno", ShortName: "vcf2anno", Domain: "germline", Workflow: "VCF2Anno", Description: "VCF SNP/InDel annotation", Inputs: mustParseInputs(`{
+"VCF2Anno.prefix":"sample", "VCF2Anno.vcf":"", "VCF2Anno.assembly":"GRCh37", "VCF2Anno.fasta":"/mnt/data/database/Homo_sapiens.GRCh37.dna.primary_assembly.fa", "VCF2Anno.ref_dir":"/mnt/data/database", "VCF2Anno.cache_dir":"/mnt/data/database/vep", "VCF2Anno.schema_bundle":"/mnt/data/database/schema_bundle", "VCF2Anno.threads":8, "VCF2Anno.clinvar_version":"20260415", "VCF2Anno.sex_min_sites":100, "VCF2Anno.female_max_ratio":0.5, "VCF2Anno.male_min_ratio":0.7
+}`)},
+	"germline_single": {
+		Name:        "germline_single",
+		ShortName:   "single",
+		Domain:      "germline",
+		Workflow:    "SingleWES",
+		Description: "Single-sample WES workflow",
+		Inputs: mustParseInputs(`{
+			"SingleWES.prefix": "proband",
+			"SingleWES.read_1": "/mnt/data/test/202511_proband_ILMN_1.fq.gz",
+			"SingleWES.read_2": "/mnt/data/test/202511_proband_ILMN_2.fq.gz",
+			"SingleWES.fasta": "/mnt/data/database/Homo_sapiens.GRCh37.dna.primary_assembly.fa",
+			"SingleWES.bed": "/mnt/data/database/hg19_default.bed",
+			"SingleWES.flank_size": 50,
+			"SingleWES.assembly": "GRCh37",
+			"SingleWES.ref_dir": "/mnt/data/database",
+			"SingleWES.cnvkit_reference": "/mnt/data/database/schema_bundle/hg19_reference.cnvkit.cnn",
+			"SingleWES.sry_sex_cutoff": 20,
+			"SingleWES.cnv_bin_size": 20000,
+			"SingleWES.cnv_dup_threshold": 2.5,
+			"SingleWES.cnv_del_threshold": 1.5,
+			"SingleWES.cache_dir": "/mnt/data/database/vep",
+			"SingleWES.schema_bundle": "/mnt/data/database/schema_bundle"
+		}`),
+	},
+	"germline_trio": {
+		Name:        "germline_trio",
+		ShortName:   "trio",
+		Domain:      "germline",
+		Workflow:    "TrioWES",
+		Description: "Trio WES workflow",
+		Inputs: mustParseInputs(`{
+			"TrioWES.prefix": "proband",
+			"TrioWES.meta_info": {
+				"members": ["proband", "father", "mother"],
+				"read_1": [
+					"/mnt/data/test/202511_proband_ILMN_1.fq.gz",
+					"/mnt/data/test/202511_father_ILMN_1.fq.gz",
+					"/mnt/data/test/202511_mother_ILMN_1.fq.gz"
+				],
+				"read_2": [
+					"/mnt/data/test/202511_proband_ILMN_2.fq.gz",
+					"/mnt/data/test/202511_father_ILMN_2.fq.gz",
+					"/mnt/data/test/202511_mother_ILMN_2.fq.gz"
+				]
+			},
+			"TrioWES.fasta": "/mnt/data/database/Homo_sapiens.GRCh37.dna.primary_assembly.fa",
+			"TrioWES.bed": "/mnt/data/database/hg19_default.bed",
+			"TrioWES.flank_size": 50,
+			"TrioWES.ped": "/mnt/data/test/ped.txt",
+			"TrioWES.assembly": "GRCh37",
+			"TrioWES.ref_dir": "/mnt/data/database",
+			"TrioWES.cnvkit_reference": "/mnt/data/database/schema_bundle/hg19_reference.cnvkit.cnn",
+			"TrioWES.sry_sex_cutoff": 20,
+			"TrioWES.cnv_bin_size": 20000,
+			"TrioWES.cnv_dup_threshold": 2.5,
+			"TrioWES.cnv_del_threshold": 1.5,
+			"TrioWES.cache_dir": "/mnt/data/database/vep",
+			"TrioWES.schema_bundle": "/mnt/data/database/schema_bundle"
+		}`),
+	},
+	"germline_baseline_fix": {
+		Name:        "germline_baseline_fix",
+		ShortName:   "baseline_fix",
+		Domain:      "germline",
+		Workflow:    "CNVBaselineFix",
+		Description: "Calibrate the built-in CNV baseline with selected normal samples",
+		Inputs: mustParseInputs(`{
+			"CNVBaselineFix.prefix": "reference",
+			"CNVBaselineFix.bed": "/mnt/data/database/hg19_default.bed",
+			"CNVBaselineFix.fasta": "/mnt/data/database/Homo_sapiens.GRCh37.dna.primary_assembly.fa",
+			"CNVBaselineFix.assembly": "GRCh37",
+			"CNVBaselineFix.existing_reference": "/mnt/data/database/schema_bundle/hg19_reference.cnvkit.cnn",
+			"CNVBaselineFix.existing_sample_count": 20,
+			"CNVBaselineFix.read_1": [
+				"/mnt/data/test/202511_father_ILMN_1.fq.gz",
+				"/mnt/data/test/202511_mother_ILMN_1.fq.gz"
+			],
+			"CNVBaselineFix.read_2": [
+				"/mnt/data/test/202511_father_ILMN_2.fq.gz",
+				"/mnt/data/test/202511_mother_ILMN_2.fq.gz"
+			],
+			"CNVBaselineFix.ref_dir": "/mnt/data/database"
+		}`),
+	},
+}
+
+var adjustableThresholdSuffixes = []string{
+	"sex_min_sites", "female_max_ratio", "male_min_ratio", "sry_sex_cutoff", "cnv_bin_size", "cnv_dup_threshold", "cnv_del_threshold",
+}
+
+// AdjustableThresholdSuffixes returns the workflow parameters that SaaS
+// administrators may override. Reference/resource paths remain code-owned.
+func AdjustableThresholdSuffixes() []string {
+	return append([]string(nil), adjustableThresholdSuffixes...)
+}
+
+func mustParseInputs(raw string) map[string]interface{} {
+	var inputs map[string]interface{}
+	if err := json.Unmarshal([]byte(raw), &inputs); err != nil {
+		panic(err)
+	}
+	return inputs
+}
+
+// ListDefinitions returns all workflow definitions sorted by name.
+func ListDefinitions() []Definition {
+	names := make([]string, 0, len(definitions))
+	for name := range definitions {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	result := make([]Definition, 0, len(names))
+	for _, name := range names {
+		result = append(result, cloneDefinition(definitions[name]))
+	}
+	return result
+}
+
+// GetDefinition returns a workflow definition by name.
+func GetDefinition(name string) (Definition, bool) {
+	def, ok := definitions[name]
+	if !ok {
+		return Definition{}, false
+	}
+	return cloneDefinition(def), true
+}
+
+// InputsForGenome returns the canonical WDL inputs for a workflow short name.
+// hg38 uses the same template shape as hg19 with its reference identifiers
+// rewritten to the matching genome build.
+func InputsForGenome(shortName, genome string) (map[string]interface{}, error) {
+	for _, def := range definitions {
+		if def.ShortName != shortName {
+			continue
+		}
+		inputs := CloneInputs(def.Inputs)
+		switch strings.ToLower(strings.TrimSpace(genome)) {
+		case "", "hg19", "grch37":
+			return inputs, nil
+		case "hg38", "grch38":
+			raw, err := json.Marshal(inputs)
+			if err != nil {
+				return nil, err
+			}
+			raw = []byte(strings.ReplaceAll(strings.ReplaceAll(string(raw), "GRCh37", "GRCh38"), "hg19", "hg38"))
+			if err := json.Unmarshal(raw, &inputs); err != nil {
+				return nil, err
+			}
+			return inputs, nil
+		default:
+			return nil, fmt.Errorf("reference genome must be hg19/GRCh37 or hg38/GRCh38")
+		}
+	}
+	return nil, fmt.Errorf("unsupported workflow template: %s", shortName)
+}
+
+// IsSupported returns true if the template name is a known workflow.
+func IsSupported(name string) bool {
+	_, ok := definitions[name]
+	return ok
+}
+
+// WDLPath returns the path to the WDL file for a given template name.
+func WDLPath(templateDir, name string) (string, error) {
+	def, ok := GetDefinition(name)
+	if !ok {
+		return "", fmt.Errorf("unsupported template: %s", name)
+	}
+	return path.Join(templateDir, def.ShortName+".wdl"), nil
+}
+
+// ConfigPath returns the path to the executor config file.
+func ConfigPath(templateDir string, executor model.ExecutorType) string {
+	cfgName := "local.cfg"
+	switch executor {
+	case model.ExecutorSlurm:
+		cfgName = "slurm.cfg"
+	case model.ExecutorLSF:
+		cfgName = "lsf.cfg"
+	}
+	return path.Join(templateDir, "conf", cfgName)
+}
+
+// ToTemplate converts a Definition to an API Template response.
+func ToTemplate(templateDir string, def Definition, includeInputs bool) model.Template {
+	tmpl := model.Template{
+		Name:        def.Name,
+		ShortName:   def.ShortName,
+		Domain:      def.Domain,
+		Workflow:    def.Workflow,
+		Path:        path.Join(templateDir, def.ShortName+".wdl"),
+		Description: def.Description,
+		InputFields: inputFields(def.Inputs),
+	}
+	if includeInputs {
+		tmpl.DefaultInputs = CloneInputs(def.Inputs)
+	}
+	return tmpl
+}
+
+func inputFields(inputs map[string]interface{}) []string {
+	fields := make([]string, 0, len(inputs))
+	for field := range inputs {
+		fields = append(fields, field)
+	}
+	sort.Strings(fields)
+	return fields
+}
+
+func cloneDefinition(def Definition) Definition {
+	def.Inputs = CloneInputs(def.Inputs)
+	return def
+}
+
+// CloneInputs deep-clones an input map via JSON round-trip.
+func CloneInputs(inputs map[string]interface{}) map[string]interface{} {
+	raw, err := json.Marshal(inputs)
+	if err != nil {
+		return map[string]interface{}{}
+	}
+	var cloned map[string]interface{}
+	if err := json.Unmarshal(raw, &cloned); err != nil {
+		return map[string]interface{}{}
+	}
+	return cloned
+}
